@@ -1,16 +1,14 @@
 name: Capital Flow Radar
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
-  scan:
+  test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check Google News RSS
+      - name: Test Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -19,69 +17,23 @@ jobs:
           import os
           import json
           import urllib.request
-          import urllib.parse
-          import xml.etree.ElementTree as ET
-
-          query = '(IPO OR "secondary offering" OR "capital expenditure" OR "data center" OR "factory expansion")'
-
-          params = urllib.parse.urlencode({
-              "q": query,
-              "hl": "en-US",
-              "gl": "US",
-              "ceid": "US:en"
-          })
-
-          rss_url = "https://news.google.com/rss/search?" + params
-
-          request = urllib.request.Request(
-              rss_url,
-              headers={
-                  "User-Agent": "Mozilla/5.0"
-              }
-          )
-
-          with urllib.request.urlopen(request, timeout=30) as response:
-              data = response.read()
-
-          root = ET.fromstring(data)
-
-          items = root.findall(".//item")[:5]
 
           token = os.environ["TELEGRAM_BOT_TOKEN"]
           chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-          for item in items:
-              title = item.findtext("title", "")
-              link = item.findtext("link", "")
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-              message = (
-                  "🚨 CAPITAL FLOW ALERT\n\n"
-                  + title
-                  + "\n\n"
-                  + link
-              )
+          data = json.dumps({
+              "chat_id": chat_id,
+              "text": "✅ CAPITAL FLOW RADAR\n\nTelegram connection is working."
+          }).encode()
 
-              telegram_url = (
-                  "https://api.telegram.org/bot"
-                  + token
-                  + "/sendMessage"
-              )
+          request = urllib.request.Request(
+              url,
+              data=data,
+              headers={"Content-Type": "application/json"}
+          )
 
-              payload = json.dumps({
-                  "chat_id": chat_id,
-                  "text": message
-              }).encode("utf-8")
-
-              telegram_request = urllib.request.Request(
-                  telegram_url,
-                  data=payload,
-                  headers={"Content-Type": "application/json"}
-              )
-
-              urllib.request.urlopen(
-                  telegram_request,
-                  timeout=30
-              )
-
-          print("Successfully processed", len(items), "news items.")
+          response = urllib.request.urlopen(request)
+          print(response.read().decode())
           PY
