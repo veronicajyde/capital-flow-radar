@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test SEC API
+      - name: Scan SEC filings
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -21,45 +21,192 @@ jobs:
           import gzip
           import urllib.request
           import urllib.error
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
 
-          # SEC API
-          sec_url = "https://data.sec.gov/submissions/CIK0000320193.json"
+          USER_AGENT = "Capital Flow Radar veronicajyde@gmail.com"
+
+          # SEC EDGAR Latest Filings RSS
+          RSS_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=exclude&count=100&output=atom"
+
+          headers = {
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+              "Accept": "application/atom+xml,application/xml,text/xml"
+          }
 
           request = urllib.request.Request(
-              sec_url,
-              headers={
-                  "User-Agent": "Capital Flow Radar veronicajyde@gmail.com",
-                  "Accept-Encoding": "gzip"
-              }
+              RSS_URL,
+              headers=headers
           )
 
-          try:
-              response = urllib.request.urlopen(
-                  request,
-                  timeout=30
+          response = urllib.request.urlopen(
+              request,
+              timeout=30
+          )
+
+          raw = response.read()
+
+          if response.headers.get("Content-Encoding") == "gzip":
+              raw = gzip.decompress(raw)
+
+          root = ET.fromstring(raw)
+
+          # Atom namespace
+          ns = {
+              "atom": "http://www.w3.org/2005/Atom"
+          }
+
+          entries = root.findall("atom:entry", ns)
+
+          print("SEC connection successful.")
+          print("Filings retrieved:", len(entries))
+
+          # Capital-flow keywords
+          keywords = [
+              "capital expenditure",
+              "capital expenditures",
+              "capex",
+              "construction",
+              "data center",
+              "data centre",
+              "infrastructure",
+              "expansion",
+              "facility",
+              "facilities",
+              "manufacturing",
+              "production capacity",
+              "purchase commitment",
+              "supply agreement",
+              "definitive agreement",
+              "material agreement",
+              "contract",
+              "award",
+              "financing",
+              "credit facility",
+              "acquisition",
+              "merger",
+              "offering",
+              "public offering",
+              "private placement",
+              "proceeds",
+              "investment"
+          ]
+
+          target_forms = {
+              "8-K",
+              "S-1",
+              "S-3",
+              "424B1",
+              "424B2",
+              "424B3",
+              "424B4",
+              "424B5",
+              "6-K"
+          }
+
+          candidates = []
+
+          for entry in entries:
+
+              title = entry.findtext(
+                  "atom:title",
+                  "",
+                  ns
+              ).strip()
+
+              summary = entry.findtext(
+                  "atom:summary",
+                  "",
+                  ns
+              ).strip()
+
+              published = entry.findtext(
+                  "atom:updated",
+                  "",
+                  ns
+              ).strip()
+
+              link = ""
+
+              link_element = entry.find(
+                  "atom:link",
+                  ns
               )
 
-              raw_data = response.read()
+              if link_element is not None:
+                  link = link_element.attrib.get(
+                      "href",
+                      ""
+                  )
 
-              # Decompress gzip response
-              if response.headers.get("Content-Encoding") == "gzip":
-                  raw_data = gzip.decompress(raw_data)
+              text = (
+                  title + " " +
+                  summary
+              ).lower()
 
-              data = json.loads(
-                  raw_data.decode("utf-8")
+              matched = [
+                  word for word in keywords
+                  if word in text
+              ]
+
+              if matched:
+                  candidates.append({
+                      "title": title,
+                      "published": published,
+                      "link": link,
+                      "matches": matched[:5]
+                  })
+
+          print(
+              "Potential capital-flow filings:",
+              len(candidates)
+          )
+
+          # Send only the most relevant candidates
+          candidates = candidates[:5]
+
+          if candidates:
+
+              lines = [
+                  "🚨 CAPITAL FLOW RADAR",
+                  "",
+                  "NEW SEC CAPITAL-FLOW SIGNAL",
+                  ""
+              ]
+
+              for item in candidates:
+
+                  lines.append(
+                      f"📄 {item['title']}"
+                  )
+
+                  lines.append(
+                      f"🔎 Signals: {', '.join(item['matches'])}"
+                  )
+
+                  if item["published"]:
+                      lines.append(
+                          f"🕐 {item['published']}"
+                      )
+
+                  if item["link"]:
+                      lines.append(
+                          f"🔗 {item['link']}"
+                      )
+
+                  lines.append("")
+
+              message = "\n".join(lines)
+
+          else:
+
+              message = (
+                  "🟢 CAPITAL FLOW RADAR\n\n"
+                  "SEC scan completed.\n\n"
+                  "No new capital-flow candidates "
+                  "detected in this scan."
               )
-
-              print("SEC API connection successful.")
-              print("Company:", data["name"])
-              print(
-                  "Recent filings:",
-                  len(data["filings"]["recent"]["form"])
-              )
-
-          except urllib.error.HTTPError as e:
-              print("SEC ERROR:")
-              print(e.read().decode(errors="replace"))
-              raise
 
           # Telegram
           token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -71,11 +218,8 @@ jobs:
 
           payload = json.dumps({
               "chat_id": chat_id,
-              "text": (
-                  "🟢 CAPITAL FLOW RADAR\n\n"
-                  "SEC API connection successful.\n\n"
-                  "Real-time filing pipeline is ready."
-              )
+              "text": message,
+              "disable_web_page_preview": True
           }).encode("utf-8")
 
           telegram_request = urllib.request.Request(
@@ -86,19 +230,13 @@ jobs:
               }
           )
 
-          try:
-              telegram_response = urllib.request.urlopen(
-                  telegram_request,
-                  timeout=30
-              )
+          telegram_response = urllib.request.urlopen(
+              telegram_request,
+              timeout=30
+          )
 
-              print(
-                  telegram_response.read().decode("utf-8")
-              )
-
-          except urllib.error.HTTPError as e:
-              print("TELEGRAM ERROR:")
-              print(e.read().decode(errors="replace"))
-              raise
+          print(
+              telegram_response.read().decode("utf-8")
+          )
 
           PY
