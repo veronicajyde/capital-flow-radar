@@ -1,4 +1,3 @@
-
 name: Capital Flow Radar
 
 on:
@@ -12,43 +11,77 @@ jobs:
 
     steps:
       - name: Check Google News RSS
-        run: |
-          python - <<'PY'
-          import urllib.request
-          import xml.etree.ElementTree as ET
-          import os
-          import json
-          import urllib.request as req
-
-          RSS="https://news.google.com/rss/search?q=(IPO+OR+%22secondary+offering%22+OR+%22capital+expenditure%22+OR+%22data+center%22+OR+%22factory+expansion%22)&hl=en-US&gl=US&ceid=US:en"
-
-          data=urllib.request.urlopen(RSS).read()
-          root=ET.fromstring(data)
-
-          items=root.findall(".//item")[:5]
-
-          token=os.environ["TELEGRAM_BOT_TOKEN"]
-          chat=os.environ["TELEGRAM_CHAT_ID"]
-
-          for item in items:
-              title=item.findtext("title","")
-              link=item.findtext("link","")
-
-              text=f"🚨 CAPITAL FLOW ALERT\n\n{title}\n\n{link}"
-
-              url=f"https://api.telegram.org/bot{token}/sendMessage"
-
-              payload=json.dumps({
-                  "chat_id":chat,
-                  "text":text
-              }).encode()
-
-              req.urlopen(req.Request(
-                  url,
-                  data=payload,
-                  headers={"Content-Type":"application/json"}
-              ))
-          PY
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
+          import xml.etree.ElementTree as ET
+
+          query = '(IPO OR "secondary offering" OR "capital expenditure" OR "data center" OR "factory expansion")'
+
+          params = urllib.parse.urlencode({
+              "q": query,
+              "hl": "en-US",
+              "gl": "US",
+              "ceid": "US:en"
+          })
+
+          rss_url = "https://news.google.com/rss/search?" + params
+
+          request = urllib.request.Request(
+              rss_url,
+              headers={
+                  "User-Agent": "Mozilla/5.0"
+              }
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = response.read()
+
+          root = ET.fromstring(data)
+
+          items = root.findall(".//item")[:5]
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          for item in items:
+              title = item.findtext("title", "")
+              link = item.findtext("link", "")
+
+              message = (
+                  "🚨 CAPITAL FLOW ALERT\n\n"
+                  + title
+                  + "\n\n"
+                  + link
+              )
+
+              telegram_url = (
+                  "https://api.telegram.org/bot"
+                  + token
+                  + "/sendMessage"
+              )
+
+              payload = json.dumps({
+                  "chat_id": chat_id,
+                  "text": message
+              }).encode("utf-8")
+
+              telegram_request = urllib.request.Request(
+                  telegram_url,
+                  data=payload,
+                  headers={"Content-Type": "application/json"}
+              )
+
+              urllib.request.urlopen(
+                  telegram_request,
+                  timeout=30
+              )
+
+          print("Successfully processed", len(items), "news items.")
+          PY
