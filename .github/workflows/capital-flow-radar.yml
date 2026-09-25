@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Analyze SEC filings
+      - name: Capital Flow Beneficiary Detector
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -28,6 +28,12 @@ jobs:
 
           USER_AGENT = "Capital Flow Radar veronicajyde@gmail.com"
 
+          HEADERS = {
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+              "Accept": "text/html,application/xml,text/xml"
+          }
+
           RSS_URL = (
               "https://www.sec.gov/cgi-bin/browse-edgar"
               "?action=getcurrent"
@@ -39,16 +45,15 @@ jobs:
               "&output=atom"
           )
 
-          headers = {
-              "User-Agent": USER_AGENT,
-              "Accept-Encoding": "gzip, deflate",
-              "Accept": "application/atom+xml,application/xml,text/xml"
-          }
+          # --------------------------------------------------
+          # HTTP
+          # --------------------------------------------------
 
           def get_url(url):
+
               request = urllib.request.Request(
                   url,
-                  headers=headers
+                  headers=HEADERS
               )
 
               response = urllib.request.urlopen(
@@ -58,38 +63,39 @@ jobs:
 
               raw = response.read()
 
-              if response.headers.get("Content-Encoding") == "gzip":
+              if response.headers.get(
+                  "Content-Encoding"
+              ) == "gzip":
                   raw = gzip.decompress(raw)
 
               return raw
 
+          # --------------------------------------------------
+          # CLEAN HTML
+          # --------------------------------------------------
+
           def clean_html(text):
+
               text = unescape(text or "")
-              text = re.sub(r"<[^>]+>", " ", text)
-              text = re.sub(r"\s+", " ", text)
+              text = re.sub(
+                  r"<[^>]+>",
+                  " ",
+                  text
+              )
+
+              text = re.sub(
+                  r"\s+",
+                  " ",
+                  text
+              )
+
               return text.strip()
 
           # --------------------------------------------------
-          # GET LATEST SEC FILINGS
+          # CAPITAL SIGNALS
           # --------------------------------------------------
 
-          raw = get_url(RSS_URL)
-          root = ET.fromstring(raw)
-
-          ns = {
-              "atom": "http://www.w3.org/2005/Atom"
-          }
-
-          entries = root.findall("atom:entry", ns)
-
-          print("SEC connection successful.")
-          print("Filings retrieved:", len(entries))
-
-          # --------------------------------------------------
-          # CAPITAL-FLOW SIGNALS
-          # --------------------------------------------------
-
-          strong_signals = [
+          capital_terms = [
               "capital expenditure",
               "capital expenditures",
               "capex",
@@ -103,21 +109,39 @@ jobs:
               "facility expansion",
               "capacity expansion",
               "purchase commitment",
-              "purchase commitments",
               "supply agreement",
               "long-term supply",
-              "definitive agreement",
-              "material definitive agreement",
               "contract award",
               "awarded contract",
               "government contract",
+              "strategic investment",
+              "investment agreement",
               "financing agreement",
               "credit facility",
               "term loan",
               "acquisition",
               "merger",
-              "investment agreement",
-              "strategic investment"
+              "offering"
+          ]
+
+          beneficiary_terms = [
+              "supplier",
+              "supplied by",
+              "supply",
+              "vendor",
+              "contractor",
+              "contracted",
+              "awarded to",
+              "selected",
+              "partner",
+              "technology provider",
+              "equipment provider",
+              "manufacturer",
+              "purchase from",
+              "purchased from",
+              "orders from",
+              "order from",
+              "agreement with"
           ]
 
           money_pattern = re.compile(
@@ -127,35 +151,39 @@ jobs:
                   |
                   USD\s?
               )
-              (?:
-                  \d+(?:,\d{3})*
-                  |
-                  \d+(?:\.\d+)?
-              )
+              \d+(?:,\d{3})*(?:\.\d+)?
               \s?
               (?:billion|million|thousand|bn|mm|m|k)?
               """,
               re.IGNORECASE | re.VERBOSE
           )
 
-          # Words that often indicate the filing is NOT what
-          # our capital-flow radar is looking for.
-          weak_only_terms = {
-              "governance",
-              "director",
-              "appointment",
-              "resignation",
-              "compensation",
-              "earnings",
-              "quarterly results",
-              "press release",
-              "legal proceedings"
+          # --------------------------------------------------
+          # GET RSS
+          # --------------------------------------------------
+
+          raw = get_url(RSS_URL)
+
+          root = ET.fromstring(raw)
+
+          ns = {
+              "atom": "http://www.w3.org/2005/Atom"
           }
+
+          entries = root.findall(
+              "atom:entry",
+              ns
+          )
+
+          print(
+              "SEC filings retrieved:",
+              len(entries)
+          )
 
           candidates = []
 
           # --------------------------------------------------
-          # ANALYZE EACH FILING
+          # INITIAL FILTER
           # --------------------------------------------------
 
           for entry in entries:
@@ -191,116 +219,188 @@ jobs:
                       ""
                   )
 
-              summary_clean = clean_html(summary)
+              summary_clean = clean_html(
+                  summary
+              )
 
               combined = (
-                  title + " " + summary_clean
+                  title + " " +
+                  summary_clean
               ).lower()
 
-              matched = [
-                  signal
-                  for signal in strong_signals
-                  if signal in combined
+              matched_capital = [
+                  x for x in capital_terms
+                  if x in combined
               ]
 
-              if not matched:
+              if not matched_capital:
                   continue
-
-              # ------------------------------------------------
-              # SCORE THE FILING
-              # ------------------------------------------------
 
               score = 0
 
-              # Strong capital-flow language
-              score += min(len(matched) * 10, 40)
+              score += min(
+                  len(matched_capital) * 10,
+                  40
+              )
 
-              # Dollar amount mentioned
-              money_matches = money_pattern.findall(
+              money = money_pattern.findall(
                   combined
               )
 
-              if money_matches:
+              if money:
                   score += 25
 
-              # Infrastructure / construction / capacity
-              infrastructure_words = [
-                  "data center",
-                  "data centre",
-                  "infrastructure",
-                  "construction",
-                  "manufacturing facility",
-                  "production facility",
-                  "capacity expansion",
-                  "facility expansion"
-              ]
-
               if any(
-                  word in combined
-                  for word in infrastructure_words
+                  x in combined
+                  for x in [
+                      "data center",
+                      "data centre",
+                      "infrastructure",
+                      "construction",
+                      "manufacturing facility",
+                      "capacity expansion"
+                  ]
               ):
                   score += 20
 
-              # Contract / supply relationship
               if any(
-                  word in combined
-                  for word in [
+                  x in combined
+                  for x in [
                       "supply agreement",
-                      "purchase commitment",
                       "contract award",
-                      "government contract",
-                      "long-term supply"
+                      "awarded contract",
+                      "purchase commitment"
                   ]
               ):
                   score += 15
 
-              # Reduce weak-only filings
-              weak_matches = [
-                  word
-                  for word in weak_only_terms
-                  if word in combined
-              ]
-
-              if weak_matches and not money_matches:
-                  score -= 20
-
-              score = max(0, min(score, 100))
-
-              # Only send meaningful candidates
               if score < 40:
                   continue
 
               candidates.append({
                   "title": title,
-                  "summary": summary_clean[:700],
+                  "summary": summary_clean,
                   "published": published,
                   "link": link,
-                  "signals": matched[:6],
-                  "money": money_matches[:5],
-                  "score": score
+                  "capital_signals": matched_capital,
+                  "money": money,
+                  "score": min(score, 100)
               })
-
-          # Highest scoring first
-          candidates.sort(
-              key=lambda x: x["score"],
-              reverse=True
-          )
 
           candidates = candidates[:5]
 
           print(
-              "Qualified capital-flow candidates:",
+              "Qualified candidates:",
               len(candidates)
           )
 
           # --------------------------------------------------
-          # TELEGRAM MESSAGE
+          # RETRIEVE FILINGS
           # --------------------------------------------------
 
-          if not candidates:
-              print(
-                  "No qualifying capital-flow event detected."
+          analyzed = []
+
+          for item in candidates:
+
+              filing_text = ""
+
+              try:
+
+                  if item["link"]:
+
+                      filing_raw = get_url(
+                          item["link"]
+                      )
+
+                      filing_text = clean_html(
+                          filing_raw.decode(
+                              "utf-8",
+                              errors="replace"
+                          )
+                      )
+
+              except Exception as e:
+
+                  print(
+                      "Could not retrieve filing:",
+                      e
+                  )
+
+              # Limit text for processing
+              filing_text = filing_text[:50000]
+
+              lower_text = filing_text.lower()
+
+              beneficiary_hits = []
+
+              for term in beneficiary_terms:
+
+                  if term in lower_text:
+                      beneficiary_hits.append(
+                          term
+                      )
+
+              # ------------------------------------------------
+              # FIND SENTENCES AROUND BENEFICIARY LANGUAGE
+              # ------------------------------------------------
+
+              evidence = []
+
+              sentences = re.split(
+                  r"(?<=[.!?])\s+",
+                  filing_text
               )
+
+              for sentence in sentences:
+
+                  s_lower = sentence.lower()
+
+                  if any(
+                      term in s_lower
+                      for term in beneficiary_terms
+                  ):
+
+                      if (
+                          len(sentence) > 50
+                          and len(sentence) < 1000
+                      ):
+                          evidence.append(
+                              sentence.strip()
+                          )
+
+                  if len(evidence) >= 3:
+                      break
+
+              # ------------------------------------------------
+              # FIND MONEY REFERENCES
+              # ------------------------------------------------
+
+              filing_money = money_pattern.findall(
+                  filing_text
+              )
+
+              item["beneficiary_language"] = (
+                  beneficiary_hits[:8]
+              )
+
+              item["evidence"] = evidence
+
+              item["filing_money"] = (
+                  filing_money[:10]
+              )
+
+              analyzed.append(item)
+
+          # --------------------------------------------------
+          # TELEGRAM
+          # --------------------------------------------------
+
+          if not analyzed:
+
+              print(
+                  "No capital-flow events found."
+              )
+
               raise SystemExit(0)
 
           lines = [
@@ -310,7 +410,7 @@ jobs:
               ""
           ]
 
-          for item in candidates:
+          for item in analyzed:
 
               lines.append(
                   f"📊 SIGNAL SCORE: {item['score']}/100"
@@ -321,32 +421,110 @@ jobs:
               )
 
               if item["money"]:
+
                   lines.append(
-                      "💰 Amount detected: "
-                      + ", ".join(item["money"])
+                      "💰 Amount: " +
+                      ", ".join(
+                          item["money"][:5]
+                      )
                   )
+
+              if item["beneficiary_language"]:
+
+                  lines.append(
+                      "🏢 Beneficiary language: " +
+                      ", ".join(
+                          item[
+                              "beneficiary_language"
+                          ]
+                      )
+                  )
+
+              if item["evidence"]:
+
+                  lines.append(
+                      "🔎 Evidence:"
+                  )
+
+                  for evidence in item[
+                      "evidence"
+                  ]:
+
+                      lines.append(
+                          "• " +
+                          evidence[:500]
+                      )
 
               lines.append(
-                  "🔎 Signals: "
-                  + ", ".join(item["signals"])
+                  "🕐 " +
+                  item["published"]
               )
 
-              if item["summary"]:
-                  lines.append(
-                      "📝 "
-                      + item["summary"]
-                  )
-
-              if item["published"]:
-                  lines.append(
-                      "🕐 " + item["published"]
-                  )
-
               if item["link"]:
+
                   lines.append(
-                      "🔗 " + item["link"]
+                      "🔗 " +
+                      item["link"]
                   )
 
               lines.append("")
 
-          lines
+          lines.append(
+              "⚠️ BENEFICIARY STATUS"
+          )
+
+          lines.append(
+              "The system has identified "
+              "beneficiary evidence, but has "
+              "NOT yet verified the beneficiary "
+              "as a publicly traded Bamboo asset."
+          )
+
+          lines.append("")
+
+          lines.append(
+              "NEXT: ticker verification → "
+              "Bamboo availability → "
+              "price movement → "
+              "Alpha Score → entry/exit plan"
+          )
+
+          message = "\n".join(lines)
+
+          token = os.environ[
+              "TELEGRAM_BOT_TOKEN"
+          ]
+
+          chat_id = os.environ[
+              "TELEGRAM_CHAT_ID"
+          ]
+
+          telegram_url = (
+              f"https://api.telegram.org/"
+              f"bot{token}/sendMessage"
+          )
+
+          payload = json.dumps({
+              "chat_id": chat_id,
+              "text": message,
+              "disable_web_page_preview": True
+          }).encode("utf-8")
+
+          telegram_request = urllib.request.Request(
+              telegram_url,
+              data=payload,
+              headers={
+                  "Content-Type": "application/json"
+              }
+          )
+
+          response = urllib.request.urlopen(
+              telegram_request,
+              timeout=30
+          )
+
+          print(
+              response.read().decode("utf-8")
+          )
+
+          PY
