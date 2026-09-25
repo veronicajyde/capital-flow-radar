@@ -18,6 +18,7 @@ jobs:
           python - <<'PY'
           import os
           import json
+          import gzip
           import urllib.request
           import urllib.error
 
@@ -28,7 +29,7 @@ jobs:
               sec_url,
               headers={
                   "User-Agent": "Capital Flow Radar veronicajyde@gmail.com",
-                  "Accept-Encoding": "gzip, deflate"
+                  "Accept-Encoding": "gzip"
               }
           )
 
@@ -38,8 +39,14 @@ jobs:
                   timeout=30
               )
 
+              raw_data = response.read()
+
+              # Decompress gzip response
+              if response.headers.get("Content-Encoding") == "gzip":
+                  raw_data = gzip.decompress(raw_data)
+
               data = json.loads(
-                  response.read().decode()
+                  raw_data.decode("utf-8")
               )
 
               print("SEC API connection successful.")
@@ -51,7 +58,7 @@ jobs:
 
           except urllib.error.HTTPError as e:
               print("SEC ERROR:")
-              print(e.read().decode())
+              print(e.read().decode(errors="replace"))
               raise
 
           # Telegram
@@ -69,7 +76,7 @@ jobs:
                   "SEC API connection successful.\n\n"
                   "Real-time filing pipeline is ready."
               )
-          }).encode()
+          }).encode("utf-8")
 
           telegram_request = urllib.request.Request(
               telegram_url,
@@ -86,12 +93,12 @@ jobs:
               )
 
               print(
-                  telegram_response.read().decode()
+                  telegram_response.read().decode("utf-8")
               )
 
           except urllib.error.HTTPError as e:
               print("TELEGRAM ERROR:")
-              print(e.read().decode())
+              print(e.read().decode(errors="replace"))
               raise
 
           PY
