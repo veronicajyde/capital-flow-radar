@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test SEC connection
+      - name: Test SEC API
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -19,30 +19,56 @@ jobs:
           import os
           import json
           import urllib.request
+          import urllib.error
 
-          sec_url = "https://www.sec.gov/files/company_tickers.json"
+          # SEC API
+          sec_url = "https://data.sec.gov/submissions/CIK0000320193.json"
 
           request = urllib.request.Request(
               sec_url,
               headers={
-                  "User-Agent": "Capital Flow Radar"
+                  "User-Agent": "Capital Flow Radar veronicajyde@gmail.com",
+                  "Accept-Encoding": "gzip, deflate"
               }
           )
 
-          response = urllib.request.urlopen(request, timeout=30)
-          data = json.loads(response.read().decode())
+          try:
+              response = urllib.request.urlopen(
+                  request,
+                  timeout=30
+              )
 
-          print("SEC connection successful.")
-          print("Companies received:", len(data))
+              data = json.loads(
+                  response.read().decode()
+              )
 
+              print("SEC API connection successful.")
+              print("Company:", data["name"])
+              print(
+                  "Recent filings:",
+                  len(data["filings"]["recent"]["form"])
+              )
+
+          except urllib.error.HTTPError as e:
+              print("SEC ERROR:")
+              print(e.read().decode())
+              raise
+
+          # Telegram
           token = os.environ["TELEGRAM_BOT_TOKEN"]
           chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-          telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
+          telegram_url = (
+              f"https://api.telegram.org/bot{token}/sendMessage"
+          )
 
           payload = json.dumps({
               "chat_id": chat_id,
-              "text": "🟢 CAPITAL FLOW RADAR\n\nSEC connection successful.\n\nThe announcement-detection pipeline is ready for the next stage."
+              "text": (
+                  "🟢 CAPITAL FLOW RADAR\n\n"
+                  "SEC API connection successful.\n\n"
+                  "Real-time filing pipeline is ready."
+              )
           }).encode()
 
           telegram_request = urllib.request.Request(
@@ -53,10 +79,19 @@ jobs:
               }
           )
 
-          telegram_response = urllib.request.urlopen(
-              telegram_request,
-              timeout=30
-          )
+          try:
+              telegram_response = urllib.request.urlopen(
+                  telegram_request,
+                  timeout=30
+              )
 
-          print(telegram_response.read().decode())
+              print(
+                  telegram_response.read().decode()
+              )
+
+          except urllib.error.HTTPError as e:
+              print("TELEGRAM ERROR:")
+              print(e.read().decode())
+              raise
+
           PY
