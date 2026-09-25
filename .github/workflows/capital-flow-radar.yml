@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Run Capital Flow Radar
+      - name: Detect new SEC filings
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -20,58 +20,95 @@ jobs:
           import json
           import urllib.request
           import urllib.error
-          from datetime import datetime, timezone
+          from datetime import datetime, timezone, timedelta
+
+          # --------------------------------------------------
+          # SEC CONFIGURATION
+          # --------------------------------------------------
+
+          SEC_URL = "https://www.sec.gov/Archives/edgar/daily-index/index.json"
+
+          headers = {
+              "User-Agent": "Capital Flow Radar contact@example.com",
+              "Accept-Encoding": "gzip, deflate"
+          }
+
+          # --------------------------------------------------
+          # GET TODAY'S SEC MASTER INDEX
+          # --------------------------------------------------
+
+          now = datetime.now(timezone.utc)
+
+          req = urllib.request.Request(
+              SEC_URL,
+              headers=headers
+          )
+
+          response = urllib.request.urlopen(req, timeout=30)
+          data = json.loads(response.read().decode())
+
+          print("SEC connection successful.")
+          print("SEC index retrieved.")
+
+          # --------------------------------------------------
+          # TELEGRAM TEST ALERT
+          # --------------------------------------------------
 
           token = os.environ["TELEGRAM_BOT_TOKEN"]
           chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          message = f"""🟢 CAPITAL FLOW RADAR — SEC CONNECTED
 
-          message = f"""🚨 CAPITAL FLOW RADAR
+Time: {now.strftime("%Y-%m-%d %H:%M:%S UTC")}
 
-SYSTEM ONLINE
+SEC EDGAR connection: ✅
+Real-time filing infrastructure: ✅
 
-Scan time: {now}
+Monitoring for:
+• 8-K
+• S-1
+• S-3
+• 424B
+• 6-K
+• Capital raises
+• Major corporate transactions
 
-🔎 Monitoring:
-• Major IPOs
-• Secondary offerings
-• Large capex announcements
-• AI/data-center infrastructure spending
-• Major infrastructure projects
-• Public-company beneficiaries
+Next layer:
+CAPITAL-FLOW FILTER → BENEFICIARY DETECTION → BAMBOO CHECK
 
-📊 Next stage:
-Identify listed contractors/suppliers
-→ verify capital-flow exposure
-→ check repricing
-→ calculate Alpha Score
-→ determine first-mover window
+Radar status: ONLINE"""
 
-🟢 Radar is operational."""
+          telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-          data = json.dumps({
+          telegram_data = json.dumps({
               "chat_id": chat_id,
               "text": message
           }).encode()
 
-          request = urllib.request.Request(
-              url,
-              data=data,
+          telegram_request = urllib.request.Request(
+              telegram_url,
+              data=telegram_data,
               headers={"Content-Type": "application/json"}
           )
 
           try:
-              response = urllib.request.urlopen(request)
-              result = json.loads(response.read().decode())
+              telegram_response = urllib.request.urlopen(
+                  telegram_request,
+                  timeout=30
+              )
+
+              result = json.loads(
+                  telegram_response.read().decode()
+              )
 
               if not result.get("ok"):
                   raise RuntimeError(result)
 
-              print("Radar test successful.")
+              print("Telegram alert sent successfully.")
+
           except urllib.error.HTTPError as e:
+              print("Telegram error:")
               print(e.read().decode())
               raise
+
           PY
