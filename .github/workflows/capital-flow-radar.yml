@@ -16,69 +16,445 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Run Final Capital Flow Radar
+      - name: Run Capital Flow Radar
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
-          import urllib.request
-          import urllib.parse
-          import gzip
-          import json
           import os
           import re
+          import json
+          import gzip
           import html
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
+          import urllib.request
+          import urllib.parse
+          import urllib.error
           from datetime import datetime, timezone, timedelta
 
-          UA = "Capital Flow Radar veronicajyde@gmail.com"
-          STATE_FILE = Path("radar_state.json")
+          SEC_UA = "Capital Flow Radar veronicajyde@gmail.com"
+          STATE_FILE = "radar_state.json"
 
-          # =========================================================
-          # HTTP
-          # =========================================================
+          CAPITAL_WORDS = [
+              "capital expenditure", "capital expenditures", "capex",
+              "investment", "investments", "funding", "financing",
+              "contract", "contracts", "agreement", "definitive agreement",
+              "purchase commitment", "purchase commitments",
+              "orders", "order", "backlog", "capacity expansion",
+              "expansion", "data center", "datacenter", "infrastructure",
+              "artificial intelligence", " AI ", "cloud infrastructure",
+              "semiconductor", "manufacturing facility", "facility",
+              "construction", "equipment", "supply agreement",
+              "strategic partnership"
+          ]
 
-          def fetch(url, host=None):
-              headers = {
-                  "User-Agent": UA,
-                  "Accept-Encoding": "gzip, deflate",
-              }
+          BENEFICIARY_WORDS = [
+              "awarded to", "awarded", "selected", "supplier",
+              "supplies", "supply", "contractor", "partner",
+              "purchase from", "purchases from", "vendor",
+              "equipment provider", "provider", "customer",
+              "orders from", "ordered from", "will purchase",
+              "will procure", "procure from", "agreement with"
+          ]
 
-              if host:
-                  headers["Host"] = host
+          INFRA_WORDS = [
+              "data center", "datacenter", "power", "grid",
+              "transmission", "semiconductor", "chip",
+              "manufacturing", "factory", "facility", "capacity",
+              "server", "servers", "gpu", "cloud", "infrastructure",
+              "construction", "energy", "battery", "network"
+          ]
 
-              req = urllib.request.Request(
-                  url,
-                  headers=headers
+          def fetch(url, headers=None, timeout=20):
+              req = urllib.request.Request(url)
+              req.add_header("User-Agent", SEC_UA)
+              req.add_header("Accept-Encoding", "gzip")
+              if headers:
+                  for k, v in headers.items():
+                      req.add_header(k, v)
+
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      data = r.read()
+                      if r.headers.get("Content-Encoding", "").lower() == "gzip":
+                          data = gzip.decompress(data)
+                      return data.decode("utf-8", errors="replace")
+              except Exception:
+                  return ""
+
+          def clean_text(s):
+              s = html.unescape(s or "")
+              s = re.sub(r"<[^>]+>", " ", s)
+              s = re.sub(r"\s+", " ", s)
+              return s.strip()
+
+          def money_values(text):
+              results = []
+
+              patterns = [
+                  r"\$\s?(\d+(?:\.\d+)?)\s*(billion|bn|million|mn|thousand|k|m)\b",
+                  r"(\d+(?:\.\d+)?)\s*(billion|bn|million|mn)\s+(?:dollars|USD)",
+              ]
+
+              for pattern in patterns:
+                  for m in re.finditer(pattern, text, re.I):
+                      try:
+                          value = float(m.group(1))
+                          unit = m.group(2).lower()
+
+                          if unit in ("billion", "bn"):
+                              value *= 1_000_000_000
+                          elif unit in ("million", "mn", "m"):
+                              value *= 1_000_000
+                          elif unit in ("thousand", "k"):
+                              value *= 1_000
+
+                          results.append(value)
+                      except Exception:
+                          pass
+
+              return results
+
+          def money_label(values):
+              if not values:
+                  return "Not detected"
+
+              largest = max(values)
+
+              if largest >= 1_000_000_000:
+                  return f"${largest/1_000_000_000:.2f}B"
+              if largest >= 1_000_000:
+                  return f"${largest/1_000_000:.1f}M"
+              return f"${largest:,.0f}"
+
+          def score_text(text):
+              t = " " + text.lower() + " "
+
+              capital_hits = sum(1 for x in CAPITAL_WORDS if x.lower() in t)
+              infra_hits = sum(1 for x in INFRA_WORDS if x.lower() in t)
+              beneficiary_hits = sum(1 for x in BENEFICIARY_WORDS if x.lower() in t)
+
+              amounts = money_values(text)
+
+              score = 0
+
+              if amounts:
+                  largest = max(amounts)
+                  if largest >= 10_000_000_000:
+                      score += 35
+                  elif largest >= 1_000_000_000:
+                      score += 30
+                  elif largest >= 500_000_000:
+                      score += 25
+                  elif largest >= 100_000_000:
+                      score += 18
+                  elif largest >= 25_000_000:
+                      score += 10
+                  else:
+                      score += 5
+
+              score += min(capital_hits * 3, 15)
+              score += min(infra_hits * 4, 20)
+              score += min(beneficiary_hits * 5, 20)
+
+              return min(score, 100), amounts, beneficiary_hits
+
+          def parse_atom(feed):
+              entries = re.findall(r"<entry>(.*?)</entry>", feed, re.S | re.I)
+              output = []
+
+              for entry in entries:
+                  title = re.search(r"<title[^>]*>(.*?)</title>", entry, re.S | re.I)
+                  link = re.search(r'<link[^>]+href="([^"]+)"', entry, re.I)
+                  updated = re.search(r"<updated>(.*?)</updated>", entry, re.S | re.I)
+                  summary = re.search(r"<summary[^>]*>(.*?)</summary>", entry, re.S | re.I)
+
+                  if not title:
+                      continue
+
+                  output.append({
+                      "title": clean_text(title.group(1)),
+                      "link": link.group(1) if link else "",
+                      "updated": updated.group(1).strip() if updated else "",
+                      "summary": clean_text(summary.group(1)) if summary else ""
+                  })
+
+              return output
+
+          def parse_time(value):
+              try:
+                  value = value.replace("Z", "+00:00")
+                  dt = datetime.fromisoformat(value)
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt.astimezone(timezone.utc)
+              except Exception:
+                  return None
+
+          def recent(dt):
+              if not dt:
+                  return False
+              return dt >= datetime.now(timezone.utc) - timedelta(hours=24)
+
+          def load_tickers():
+              url = "https://www.sec.gov/files/company_tickers.json"
+              raw = fetch(url)
+
+              if not raw:
+                  return {}
+
+              try:
+                  data = json.loads(raw)
+              except Exception:
+                  return {}
+
+              result = {}
+
+              for item in data.values():
+                  ticker = str(item.get("ticker", "")).upper()
+                  title = str(item.get("title", ""))
+
+                  if ticker and title:
+                      result[ticker] = title
+
+              return result
+
+          def ticker_from_title(title, ticker_map):
+              upper = title.upper()
+
+              explicit = re.findall(r"\(([A-Z]{1,5})\)", upper)
+
+              for t in explicit:
+                  if t in ticker_map:
+                      return t
+
+              return ""
+
+          def company_candidates(title, ticker_map):
+              normalized = re.sub(r"[^A-Z0-9 ]", " ", title.upper())
+              normalized = re.sub(r"\s+", " ", normalized)
+
+              found = []
+
+              # Prefer longer company names to reduce false matches.
+              companies = sorted(
+                  ticker_map.items(),
+                  key=lambda x: len(x[1]),
+                  reverse=True
               )
 
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  data = r.read()
+              for ticker, name in companies:
+                  n = re.sub(r"[^A-Z0-9 ]", " ", name.upper())
+                  n = re.sub(r"\s+", " ", n).strip()
 
-                  if r.headers.get(
-                      "Content-Encoding", ""
-                  ).lower() == "gzip":
-                      data = gzip.decompress(data)
+                  if len(n) < 5:
+                      continue
 
-                  return data.decode(
-                      "utf-8",
-                      errors="replace"
-                  )
+                  if n in normalized:
+                      found.append((ticker, name))
 
-          # =========================================================
-          # TELEGRAM
-          # =========================================================
+                      if len(found) >= 3:
+                          break
 
-          def telegram(message):
-              token = os.environ["TELEGRAM_BOT_TOKEN"]
-              chat = os.environ["TELEGRAM_CHAT_ID"]
+              return found
+
+          def news_events():
+              queries = [
+                  '"billion" (contract OR investment OR capex OR agreement) (AI OR data center OR infrastructure)',
+                  '"billion" (supplier OR contractor OR purchase OR order) (AI OR semiconductor OR energy)',
+                  '"million" (contract OR investment OR expansion OR facility) (AI OR infrastructure)',
+                  '"capital expenditure" OR "capex" (data center OR AI OR semiconductor)'
+              ]
+
+              events = []
+
+              for query in queries:
+                  params = urllib.parse.urlencode({
+                      "query": query,
+                      "mode": "artlist",
+                      "maxrecords": "25",
+                      "format": "json",
+                      "timespan": "24h"
+                  })
+
+                  url = "https://api.gdeltproject.org/api/v2/doc/doc?" + params
+                  raw = fetch(url, timeout=20)
+
+                  if not raw:
+                      continue
+
+                  try:
+                      data = json.loads(raw)
+                  except Exception:
+                      continue
+
+                  for article in data.get("articles", []):
+                      title = clean_text(article.get("title", ""))
+                      url2 = article.get("url", "")
+                      source = article.get("domain", "")
+                      seen = article.get("seendate", "")
+
+                      if not title:
+                          continue
+
+                      text = title
+
+                      score, amounts, beneficiary_hits = score_text(text)
+
+                      if not amounts:
+                          continue
+
+                      if score < 25:
+                          continue
+
+                      events.append({
+                          "type": "NEWS",
+                          "title": title,
+                          "link": url2,
+                          "source": source,
+                          "seen": seen,
+                          "text": text,
+                          "score": score,
+                          "amounts": amounts,
+                          "beneficiary_hits": beneficiary_hits
+                      })
+
+              return events
+
+          def sec_events():
+              feeds = [
+                  ("8-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=exclude&count=100&output=atom"),
+                  ("6-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=6-K&company=&dateb=&owner=exclude&count=100&output=atom"),
+                  ("S-1", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-1&company=&dateb=&owner=exclude&count=100&output=atom"),
+                  ("S-3", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-3&company=&dateb=&owner=exclude&count=100&output=atom"),
+                  ("424B4", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=424B4&company=&dateb=&owner=exclude&count=100&output=atom")
+              ]
+
+              events = []
+
+              for form, url in feeds:
+                  raw = fetch(url)
+
+                  if not raw:
+                      continue
+
+                  for item in parse_atom(raw):
+                      dt = parse_time(item["updated"])
+
+                      if not recent(dt):
+                          continue
+
+                      text = item["title"] + " " + item["summary"]
+
+                      score, amounts, beneficiary_hits = score_text(text)
+
+                      if score < 20:
+                          continue
+
+                      events.append({
+                          "type": "SEC",
+                          "form": form,
+                          "title": item["title"],
+                          "link": item["link"],
+                          "source": "SEC",
+                          "seen": item["updated"],
+                          "text": text,
+                          "score": score,
+                          "amounts": amounts,
+                          "beneficiary_hits": beneficiary_hits
+                      })
+
+              return events
+
+          def yahoo_price(ticker):
+              if not ticker:
+                  return None
 
               url = (
-                  f"https://api.telegram.org/"
-                  f"bot{token}/sendMessage"
+                  "https://query1.finance.yahoo.com/v8/finance/chart/"
+                  + urllib.parse.quote(ticker)
+                  + "?range=5d&interval=1d"
               )
+
+              raw = fetch(url, timeout=15)
+
+              if not raw:
+                  return None
+
+              try:
+                  data = json.loads(raw)
+                  result = data["chart"]["result"][0]
+                  closes = result["indicators"]["quote"][0]["close"]
+
+                  closes = [x for x in closes if x is not None]
+
+                  if len(closes) < 2:
+                      return None
+
+                  previous = closes[-2]
+                  current = closes[-1]
+
+                  if previous == 0:
+                      return None
+
+                  return ((current - previous) / previous) * 100
+              except Exception:
+                  return None
+
+          def event_key(event):
+              base = (
+                  event.get("type", "")
+                  + "|"
+                  + event.get("title", "").lower()
+              )
+
+              return re.sub(r"[^a-z0-9|]+", "", base)[:220]
+
+          def classify(score, price_move, direct):
+              if direct:
+                  beneficiary = "DIRECT / EXPLICIT"
+              elif price_move is not None and abs(price_move) < 5:
+                  beneficiary = "POTENTIAL INDIRECT"
+              else:
+                  beneficiary = "SPECULATIVE"
+
+              if price_move is None:
+                  repricing = "PRICE DATA UNAVAILABLE"
+              elif price_move >= 8:
+                  repricing = f"ALREADY REPRICED +{price_move:.1f}%"
+              elif price_move >= 3:
+                  repricing = f"EARLY REPRICING +{price_move:.1f}%"
+              elif price_move <= -8:
+                  repricing = f"NEGATIVE MOVE {price_move:.1f}%"
+              else:
+                  repricing = f"LIMITED MOVE {price_move:+.1f}%"
+
+              if score >= 75:
+                  alpha = "HIGH SIGNAL"
+              elif score >= 55:
+                  alpha = "STRONG SIGNAL"
+              elif score >= 35:
+                  alpha = "WATCH"
+              else:
+                  alpha = "LOWER SIGNAL"
+
+              if price_move is None or abs(price_move) < 3:
+                  first_mover = "POSSIBLE FIRST-MOVER WINDOW"
+              elif abs(price_move) < 8:
+                  first_mover = "PARTIALLY REPRICED"
+              else:
+                  first_mover = "LARGELY REPRICED"
+
+              return beneficiary, repricing, alpha, first_mover
+
+          def telegram(message):
+              token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+              chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+              if not token or not chat:
+                  raise RuntimeError("Telegram secrets are missing.")
+
+              url = f"https://api.telegram.org/bot{token}/sendMessage"
 
               payload = urllib.parse.urlencode({
                   "chat_id": chat,
@@ -86,1303 +462,156 @@ jobs:
                   "disable_web_page_preview": "true"
               }).encode()
 
-              req = urllib.request.Request(
-                  url,
-                  data=payload,
-                  method="POST"
-              )
+              req = urllib.request.Request(url, data=payload, method="POST")
 
-              with urllib.request.urlopen(
-                  req,
-                  timeout=30
-              ):
-                  pass
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  return response.read().decode("utf-8", errors="replace")
 
-          # =========================================================
-          # STATE
-          # =========================================================
+          # ------------------------------------------------------------
+          # MAIN RADAR
+          # ------------------------------------------------------------
 
-          def load_state():
-              if not STATE_FILE.exists():
-                  return set()
+          print("Starting Capital Flow Radar...")
 
-              try:
-                  return set(
-                      json.loads(
-                          STATE_FILE.read_text()
-                      )
-                  )
-              except:
-                  return set()
+          ticker_map = load_tickers()
+          print(f"Loaded {len(ticker_map)} SEC-listed companies.")
 
-          def save_state(state):
-              STATE_FILE.write_text(
-                  json.dumps(
-                      sorted(list(state))[-5000:],
-                      indent=2
-                  )
-              )
+          events = []
+          events.extend(sec_events())
+          events.extend(news_events())
 
-          seen = load_state()
+          print(f"Raw qualifying events: {len(events)}")
 
-          # =========================================================
-          # SEC TICKER DATABASE
-          # =========================================================
-
-          ticker_data = json.loads(
-              fetch(
-                  "https://www.sec.gov/files/company_tickers.json",
-                  "www.sec.gov"
-              )
-          )
-
-          ticker_map = {}
-
-          for item in ticker_data.values():
-              ticker = str(
-                  item.get("ticker", "")
-              ).upper().strip()
-
-              title = str(
-                  item.get("title", "")
-              ).upper().strip()
-
-              if ticker and title:
-                  ticker_map[ticker] = title
-
-          def normalize_name(name):
-              name = name.upper()
-
-              name = re.sub(
-                  r"\b("
-                  r"INC|INCORPORATED|CORP|CORPORATION|"
-                  r"LLC|LTD|LIMITED|PLC|CO|COMPANY"
-                  r")\b",
-                  "",
-                  name
-              )
-
-              return re.sub(
-                  r"[^A-Z0-9]",
-                  "",
-                  name
-              )
-
-          def find_ticker(company):
-              target = normalize_name(company)
-
-              if not target:
-                  return None
-
-              best = None
-              best_score = 0
-
-              for ticker, title in ticker_map.items():
-
-                  candidate = normalize_name(title)
-
-                  if target == candidate:
-                      return ticker
-
-                  if (
-                      len(target) >= 6
-                      and (
-                          target in candidate
-                          or candidate in target
-                      )
-                  ):
-                      score = min(
-                          len(target),
-                          len(candidate)
-                      )
-
-                      if score > best_score:
-                          best_score = score
-                          best = ticker
-
-              return best
-
-          # =========================================================
-          # TEXT CLEANING
-          # =========================================================
-
-          def clean(text):
-              text = html.unescape(text or "")
-              text = re.sub(
-                  r"<[^>]+>",
-                  " ",
-                  text
-              )
-              text = re.sub(
-                  r"\s+",
-                  " ",
-                  text
-              )
-              return text.strip()
-
-          # =========================================================
-          # CAPITAL FLOW TERMS
-          # =========================================================
-
-          capital_terms = [
-              "capital expenditure",
-              "capital expenditures",
-              "capex",
-              "construction",
-              "data center",
-              "data centre",
-              "infrastructure",
-              "manufacturing facility",
-              "production facility",
-              "facility expansion",
-              "capacity expansion",
-              "purchase commitment",
-              "supply agreement",
-              "long-term supply",
-              "contract award",
-              "awarded contract",
-              "government contract",
-              "strategic investment",
-              "investment agreement",
-              "financing agreement",
-              "credit facility",
-              "term loan",
-              "acquisition",
-              "merger",
-              "initial public offering",
-              "secondary offering",
-              "private placement",
-              "orders",
-              "purchase agreement",
-              "investment"
-          ]
-
-          beneficiary_terms = [
-              "supplier",
-              "supplied by",
-              "vendor",
-              "contractor",
-              "contracted",
-              "awarded to",
-              "selected",
-              "partner",
-              "technology provider",
-              "equipment provider",
-              "manufacturer",
-              "purchase from",
-              "purchased from",
-              "orders from",
-              "order from",
-              "agreement with",
-              "contract with"
-          ]
-
-          infrastructure_terms = [
-              "data center",
-              "data centre",
-              "power",
-              "grid",
-              "manufacturing",
-              "factory",
-              "facility",
-              "semiconductor",
-              "chip",
-              "server",
-              "cloud",
-              "battery",
-              "energy",
-              "industrial",
-              "infrastructure",
-              "ai compute",
-              "artificial intelligence",
-              "hyperscaler",
-              "warehouse"
-          ]
-
-          money_pattern = re.compile(
-              r"(?i)"
-              r"(?:\$|USD\s*)"
-              r"\s*\d+(?:\.\d+)?"
-              r"\s*(?:billion|million|thousand|bn|mm|m|k)"
-          )
-
-          def signal_score(text):
-              lower = text.lower()
-
-              cap = sum(
-                  1 for x in capital_terms
-                  if x in lower
-              )
-
-              infra = sum(
-                  1 for x in infrastructure_terms
-                  if x in lower
-              )
-
-              ben = sum(
-                  1 for x in beneficiary_terms
-                  if x in lower
-              )
-
-              money = len(
-                  money_pattern.findall(text)
-              )
-
-              return min(
-                  100,
-                  min(cap * 6, 24)
-                  + min(infra * 4, 20)
-                  + min(ben * 6, 24)
-                  + min(money * 16, 32)
-              )
-
-          # =========================================================
-          # MONEY
-          # =========================================================
-
-          def money_value(text):
-
-              values = []
-
-              for match in money_pattern.findall(text):
-
-                  number = re.search(
-                      r"\d+(?:\.\d+)?",
-                      match
-                  )
-
-                  if not number:
-                      continue
-
-                  value = float(
-                      number.group()
-                  )
-
-                  upper = match.upper()
-
-                  if (
-                      "BILLION" in upper
-                      or "BN" in upper
-                  ):
-                      value *= 1_000_000_000
-
-                  elif (
-                      "MILLION" in upper
-                      or "MM" in upper
-                  ):
-                      value *= 1_000_000
-
-                  elif (
-                      "THOUSAND" in upper
-                      or "K" in upper
-                  ):
-                      value *= 1_000
-
-                  values.append(value)
-
-              return max(values) if values else 0
-
-          def money_display(value):
-
-              if value >= 1_000_000_000:
-                  return (
-                      f"${value / 1_000_000_000:.2f}B"
-                  )
-
-              if value >= 1_000_000:
-                  return (
-                      f"${value / 1_000_000:.1f}M"
-                  )
-
-              if value >= 1_000:
-                  return (
-                      f"${value / 1_000:.0f}K"
-                  )
-
-              return "Not clearly detected"
-
-          # =========================================================
-          # EVIDENCE
-          # =========================================================
-
-          def get_evidence(text):
-
-              sentences = re.split(
-                  r"(?<=[.!?])\s+",
-                  text
-              )
-
-              results = []
-
-              for sentence in sentences:
-
-                  lower = sentence.lower()
-
-                  if any(
-                      term in lower
-                      for term in beneficiary_terms
-                  ):
-
-                      sentence = sentence.strip()
-
-                      if len(sentence) >= 60:
-                          results.append(
-                              sentence[:600]
-                          )
-
-                  if len(results) >= 4:
-                      break
-
-              return results
-
-          # =========================================================
-          # EXTRACT POSSIBLE COMPANY NAMES
-          # =========================================================
-
-          company_suffixes = (
-              "Inc.",
-              "Inc",
-              "Corp.",
-              "Corporation",
-              "Ltd.",
-              "Limited",
-              "PLC",
-              "LLC",
-              "Company",
-              "Co."
-          )
-
-          def beneficiary_tickers(text):
-
-              found = []
-
-              # Look for capitalized company names
-              pattern = re.compile(
-                  r"\b"
-                  r"([A-Z][A-Za-z0-9&.-]+"
-                  r"(?:\s+[A-Z][A-Za-z0-9&.-]+){0,5}"
-                  r"\s+(?:Inc\.?|Corp\.?|Corporation|"
-                  r"Ltd\.?|Limited|PLC|LLC|Company|Co\.))"
-              )
-
-              for match in pattern.findall(text):
-
-                  ticker = find_ticker(match)
-
-                  if (
-                      ticker
-                      and ticker not in found
-                  ):
-                      found.append(ticker)
-
-                  if len(found) >= 5:
-                      break
-
-              return found
-
-          # =========================================================
-          # PRICE / MARKET REPRICING
-          # =========================================================
-
-          def get_price(ticker):
-
-              try:
-
-                  url = (
-                      "https://query1.finance.yahoo.com/"
-                      "v8/finance/chart/"
-                      + urllib.parse.quote(ticker)
-                      + "?range=5d&interval=1d"
-                  )
-
-                  data = json.loads(
-                      fetch(url)
-                  )
-
-                  result = (
-                      data["chart"]["result"][0]
-                  )
-
-                  closes = (
-                      result["indicators"]
-                      ["quote"][0]["close"]
-                  )
-
-                  closes = [
-                      float(x)
-                      for x in closes
-                      if x is not None
-                  ]
-
-                  if len(closes) < 2:
-                      return None
-
-                  current = closes[-1]
-                  previous = closes[-2]
-
-                  one_day = (
-                      (current - previous)
-                      / previous
-                      * 100
-                  )
-
-                  five_day = None
-
-                  if len(closes) >= 5:
-
-                      start = closes[0]
-
-                      five_day = (
-                          (current - start)
-                          / start
-                          * 100
-                      )
-
-                  return {
-                      "price": current,
-                      "one_day": one_day,
-                      "five_day": five_day
-                  }
-
-              except Exception as e:
-
-                  print(
-                      "Price lookup failed:",
-                      ticker,
-                      e
-                  )
-
-                  return None
-
-          def repricing(price):
-
-              if not price:
-                  return "UNKNOWN"
-
-              move = price["one_day"]
-
-              if move >= 10:
-                  return "HEAVILY REPRICED"
-
-              if move >= 5:
-                  return "STRONGLY REPRICED"
-
-              if move >= 2:
-                  return "PARTIALLY REPRICED"
-
-              if move <= -5:
-                  return "NEGATIVE REACTION"
-
-              return "LITTLE / NO REPRICING"
-
-          # =========================================================
-          # GDELT NEWS
-          # =========================================================
-
-          news_queries = [
-              '"capital expenditure" OR capex',
-              '"data center" OR "data centre"',
-              '"contract award" OR "awarded contract"',
-              '"supply agreement" OR "purchase agreement"',
-              '"strategic investment" OR "investment agreement"',
-              '"manufacturing facility" OR "factory expansion"',
-              '"infrastructure investment"',
-              '"AI infrastructure" OR "AI compute"',
-              '"billion contract" OR "billion investment"',
-              '"million contract" OR "million investment"'
-          ]
-
-          def gdelt_articles(query):
-
-              encoded = urllib.parse.quote(
-                  f"({query})"
-              )
-
-              url = (
-                  "https://api.gdeltproject.org/"
-                  "api/v2/doc/doc?"
-                  f"query={encoded}"
-                  "&mode=artlist"
-                  "&maxrecords=50"
-                  "&timespan=24h"
-                  "&sort=datedesc"
-                  "&format=json"
-              )
-
-              try:
-
-                  data = json.loads(
-                      fetch(url)
-                  )
-
-                  return data.get(
-                      "articles",
-                      []
-                  )
-
-              except Exception as e:
-
-                  print(
-                      "GDELT error:",
-                      e
-                  )
-
-                  return []
-
-          news_candidates = {}
-
-          for query in news_queries:
-
-              for article in gdelt_articles(
-                  query
-              ):
-
-                  title = clean(
-                      article.get(
-                          "title",
-                          ""
-                      )
-                  )
-
-                  url = article.get(
-                      "url",
-                      ""
-                  )
-
-                  published = article.get(
-                      "seendate",
-                      ""
-                  )
-
-                  if not title or not url:
-                      continue
-
-                  article_id = (
-                      "NEWS:" + url
-                  )
-
-                  if article_id in seen:
-                      continue
-
-                  # Fetch article where possible
-                  try:
-                      body = clean(
-                          fetch(url)
-                      )
-                  except:
-                      body = ""
-
-                  combined = (
-                      title + " " + body
-                  )
-
-                  score = signal_score(
-                      combined
-                  )
-
-                  if score < 45:
-                      continue
-
-                  existing = news_candidates.get(
-                      article_id
-                  )
-
-                  candidate = {
-                      "id": article_id,
-                      "source": "NEWS",
-                      "form": "NEWS",
-                      "company": title,
-                      "ticker": None,
-                      "title": title,
-                      "url": url,
-                      "updated": published,
-                      "score": score,
-                      "money": money_value(
-                          combined
-                      ),
-                      "evidence": get_evidence(
-                          combined
-                      ),
-                      "beneficiaries":
-                          beneficiary_tickers(
-                              combined
-                          )
-                  }
-
-                  if (
-                      existing is None
-                      or candidate["score"]
-                      > existing["score"]
-                  ):
-                      news_candidates[
-                          article_id
-                      ] = candidate
-
-          # =========================================================
-          # SEC FEEDS
-          # =========================================================
-
-          sec_feeds = [
-              (
-                  "8-K",
-                  "https://www.sec.gov/cgi-bin/"
-                  "browse-edgar?action=getcurrent"
-                  "&type=8-K&company=&dateb="
-                  "&owner=exclude&count=100"
-                  "&output=atom"
-              ),
-              (
-                  "6-K",
-                  "https://www.sec.gov/cgi-bin/"
-                  "browse-edgar?action=getcurrent"
-                  "&type=6-K&company=&dateb="
-                  "&owner=exclude&count=100"
-                  "&output=atom"
-              ),
-              (
-                  "S-1",
-                  "https://www.sec.gov/cgi-bin/"
-                  "browse-edgar?action=getcurrent"
-                  "&type=S-1&company=&dateb="
-                  "&owner=exclude&count=100"
-                  "&output=atom"
-              ),
-              (
-                  "S-3",
-                  "https://www.sec.gov/cgi-bin/"
-                  "browse-edgar?action=getcurrent"
-                  "&type=S-3&company=&dateb="
-                  "&owner=exclude&count=100"
-                  "&output=atom"
-              ),
-              (
-                  "424B4",
-                  "https://www.sec.gov/cgi-bin/"
-                  "browse-edgar?action=getcurrent"
-                  "&type=424B4&company=&dateb="
-                  "&owner=exclude&count=100"
-                  "&output=atom"
-              )
-          ]
-
-          sec_candidates = []
-
-          now = datetime.now(
-              timezone.utc
-          )
-
-          for form, feed in sec_feeds:
-
-              try:
-
-                  raw = fetch(
-                      feed,
-                      "www.sec.gov"
-                  )
-
-                  root = ET.fromstring(
-                      raw
-                  )
-
-                  ns = {
-                      "atom":
-                      "http://www.w3.org/2005/Atom"
-                  }
-
-                  entries = root.findall(
-                      "atom:entry",
-                      ns
-                  )
-
-                  for entry in entries:
-
-                      title = entry.findtext(
-                          "atom:title",
-                          "",
-                          ns
-                      )
-
-                      updated = entry.findtext(
-                          "atom:updated",
-                          "",
-                          ns
-                      )
-
-                      accession = entry.findtext(
-                          "atom:id",
-                          "",
-                          ns
-                      )
-
-                      link_node = entry.find(
-                          "atom:link",
-                          ns
-                      )
-
-                      if link_node is None:
-                          continue
-
-                      url = link_node.attrib.get(
-                          "href",
-                          ""
-                      )
-
-                      uid = (
-                          accession or url
-                      )
-
-                      if uid in seen:
-                          continue
-
-                      try:
-
-                          dt = datetime.fromisoformat(
-                              updated.replace(
-                                  "Z",
-                                  "+00:00"
-                              )
-                          )
-
-                          if (
-                              now - dt
-                              > timedelta(hours=24)
-                          ):
-                              continue
-
-                      except:
-                          pass
-
-                      try:
-                          filing = clean(
-                              fetch(
-                                  url,
-                                  "www.sec.gov"
-                              )
-                          )
-                      except:
-                          filing = ""
-
-                      combined = (
-                          title + " " + filing
-                      )
-
-                      score = signal_score(
-                          combined
-                      )
-
-                      if score < 45:
-                          continue
-
-                      match = re.search(
-                          r"(?:8-K|6-K|S-1|S-3|424B4?)"
-                          r"\s*-\s*(.*?)\s*\(\d+\)",
-                          title,
-                          re.I
-                      )
-
-                      if match:
-                          company = (
-                              match.group(1)
-                              .strip()
-                          )
-                      else:
-                          company = title
-
-                      ticker = find_ticker(
-                          company
-                      )
-
-                      sec_candidates.append({
-                          "id": uid,
-                          "source": "SEC",
-                          "form": form,
-                          "company": company,
-                          "ticker": ticker,
-                          "title": title,
-                          "url": url,
-                          "updated": updated,
-                          "score": score,
-                          "money":
-                              money_value(
-                                  combined
-                              ),
-                          "evidence":
-                              get_evidence(
-                                  combined
-                              ),
-                          "beneficiaries":
-                              beneficiary_tickers(
-                                  combined
-                              )
-                      })
-
-                  except Exception as e:
-
-                      print(
-                          f"SEC feed error {form}:",
-                          e
-                      )
-
-          # =========================================================
-          # COMBINE
-          # =========================================================
-
-          all_candidates = (
-              sec_candidates
-              + list(
-                  news_candidates.values()
-              )
-          )
-
-          # Remove duplicates by URL/title
+          # Deduplicate within this run.
           unique = {}
 
-          for item in all_candidates:
+          for event in events:
+              key = event_key(event)
 
-              key = (
-                  item["url"]
-                  or item["title"]
+              if key not in unique or event["score"] > unique[key]["score"]:
+                  unique[key] = event
+
+          events = list(unique.values())
+
+          # Load persistent state.
+          try:
+              with open(STATE_FILE, "r", encoding="utf-8") as f:
+                  state = json.load(f)
+          except Exception:
+              state = {"seen": []}
+
+          seen = set(state.get("seen", []))
+
+          alerts = []
+
+          for event in sorted(events, key=lambda x: x["score"], reverse=True):
+
+              key = event_key(event)
+
+              if key in seen:
+                  continue
+
+              title = event["title"]
+              text = event["text"]
+
+              ticker = ticker_from_title(title, ticker_map)
+
+              candidates = company_candidates(title, ticker_map)
+
+              if not ticker and candidates:
+                  ticker = candidates[0][0]
+
+              direct = event["beneficiary_hits"] >= 1
+
+              price_move = yahoo_price(ticker) if ticker else None
+
+              beneficiary, repricing, alpha, first_mover = classify(
+                  event["score"],
+                  price_move,
+                  direct
               )
 
-              existing = unique.get(key)
+              # Do not promote purely speculative events to the main alert.
+              if beneficiary == "SPECULATIVE" and event["score"] < 70:
+                  seen.add(key)
+                  continue
 
-              if (
-                  existing is None
-                  or item["score"]
-                  > existing["score"]
-              ):
-                  unique[key] = item
+              amount = money_label(event["amounts"])
 
-          all_candidates = list(
-              unique.values()
-          )
+              candidate_text = ""
 
-          # Highest capital-flow signals first
-          all_candidates.sort(
-              key=lambda x: (
-                  x["score"],
-                  x["money"]
-              ),
-              reverse=True
-          )
-
-          # Keep Telegram manageable
-          all_candidates = all_candidates[:10]
-
-          # =========================================================
-          # ALERT GENERATION
-          # =========================================================
-
-          for item in all_candidates:
-
-              ticker = (
-                  item["ticker"]
-                  or "NOT IDENTIFIED"
-              )
-
-              price = None
-
-              if (
-                  ticker != "NOT IDENTIFIED"
-                  and len(ticker) <= 5
-              ):
-                  price = get_price(
-                      ticker
+              if candidates:
+                  candidate_text = "\n".join(
+                      f"• {t} — {n}" for t, n in candidates
                   )
-
-              # Check named beneficiary tickers too
-              beneficiary_prices = []
-
-              for bt in item.get(
-                  "beneficiaries",
-                  []
-              )[:5]:
-
-                  bp = get_price(bt)
-
-                  if bp:
-                      beneficiary_prices.append(
-                          (
-                              bt,
-                              bp
-                          )
-                      )
-
-              status = repricing(
-                  price
-              )
-
-              # -----------------------------------------------------
-              # ALPHA SCORE
-              # -----------------------------------------------------
-
-              alpha = item["score"]
-
-              if item["money"] >= 1_000_000_000:
-                  alpha += 8
-              elif item["money"] >= 250_000_000:
-                  alpha += 5
-              elif item["money"] >= 50_000_000:
-                  alpha += 3
-
-              if item["evidence"]:
-                  alpha += 7
-
-              if item.get(
-                  "beneficiaries"
-              ):
-                  alpha += 5
-
-              if status == (
-                  "LITTLE / NO REPRICING"
-              ):
-                  alpha += 5
-
-              elif status == (
-                  "PARTIALLY REPRICED"
-              ):
-                  alpha += 2
-
-              alpha = min(
-                  alpha,
-                  100
-              )
-
-              # -----------------------------------------------------
-              # FIRST MOVER
-              # -----------------------------------------------------
-
-              if status == (
-                  "LITTLE / NO REPRICING"
-              ):
-
-                  first_mover = (
-                      "🟢 POTENTIAL FIRST-MOVER WINDOW"
-                  )
-
-              elif status == (
-                  "PARTIALLY REPRICED"
-              ):
-
-                  first_mover = (
-                      "🟡 PARTIALLY REPRICED"
-                  )
-
-              elif status in (
-                  "STRONGLY REPRICED",
-                  "HEAVILY REPRICED"
-              ):
-
-                  first_mover = (
-                      "🔴 ALREADY SIGNIFICANTLY REPRICED"
-                  )
-
+              elif ticker:
+                  candidate_text = f"• {ticker}"
               else:
+                  candidate_text = "• No public-company beneficiary verified yet"
 
-                  first_mover = (
-                      "⚪ REPRICING UNKNOWN"
-                  )
-
-              # -----------------------------------------------------
-              # PRICE TEXT
-              # -----------------------------------------------------
-
-              if price:
-
-                  price_text = (
-                      f"${price['price']:.2f}"
-                  )
-
-                  day_text = (
-                      f"{price['one_day']:+.2f}%"
-                  )
-
-                  if price["five_day"] is not None:
-                      five_text = (
-                          f"{price['five_day']:+.2f}%"
-                      )
-                  else:
-                      five_text = "N/A"
-
-              else:
-
-                  price_text = "Unavailable"
-                  day_text = "N/A"
-                  five_text = "N/A"
-
-              # -----------------------------------------------------
-              # BENEFICIARY CLASSIFICATION
-              # -----------------------------------------------------
-
-              if item.get(
-                  "beneficiaries"
-              ):
-
-                  beneficiary_text = (
-                      "DIRECT/INDIRECT CANDIDATES:\n"
-                      + "\n".join(
-                          "• " + x
-                          for x in item[
-                              "beneficiaries"
-                          ][:5]
-                      )
-                  )
-
-                  beneficiary_warning = (
-                      "⚠️ Candidate identification "
-                      "requires confirmation from the "
-                      "underlying announcement."
-                  )
-
-              elif item["evidence"]:
-
-                  beneficiary_text = (
-                      "BENEFICIARY EVIDENCE FOUND"
-                  )
-
-                  beneficiary_warning = (
-                      "⚠️ Named beneficiary could not "
-                      "be reliably mapped to a public ticker."
-                  )
-
-              else:
-
-                  beneficiary_text = (
-                      "No reliable beneficiary identified."
-                  )
-
-                  beneficiary_warning = (
-                      "⚠️ Treat industry exposure as "
-                      "speculative until confirmed."
-                  )
-
-              # -----------------------------------------------------
-              # BAMBOO
-              # -----------------------------------------------------
-
-              bamboo = (
-                  "CHECK REQUIRED — automated Bamboo "
-                  "execution verification is not available."
-              )
-
-              # -----------------------------------------------------
-              # ENTRY / EXIT FRAMEWORK
-              # -----------------------------------------------------
-
-              if status == (
-                  "LITTLE / NO REPRICING"
-              ):
-
+              if ticker:
+                  bamboo = "CHECK REQUIRED — verify ticker in Bamboo before execution"
                   entry = (
-                      "Wait for confirmation of the catalyst "
-                      "and a controlled breakout/retest. "
-                      "Do not chase the headline spike."
+                      f"Wait for confirmation above the catalyst/reaction high "
+                      f"with volume; avoid chasing a large gap."
                   )
-
-                  exit = (
-                      "Reassess if the catalyst is weakened, "
-                      "cancelled or contradicted. For a trading "
-                      "position, consider partial profit-taking "
-                      "into strong extension and protect against "
-                      "loss of the catalyst reaction low."
+                  exit_plan = (
+                      "Invalidation: below the catalyst reaction low. "
+                      "If momentum stalls for ~5 trading sessions, reassess/exit. "
+                      "Consider taking partial profit into a strong +10–15% move."
                   )
-
-              elif status == (
-                  "PARTIALLY REPRICED"
-              ):
-
-                  entry = (
-                      "Avoid chasing the initial move. "
-                      "Look for a pullback/retest followed by "
-                      "renewed volume and confirmation."
-                  )
-
-                  exit = (
-                      "Reassess on failure of the retest or "
-                      "material deterioration of the catalyst. "
-                      "Consider partial profit-taking if the "
-                      "stock makes a sharp extension."
-                  )
-
-              elif status in (
-                  "STRONGLY REPRICED",
-                  "HEAVILY REPRICED"
-              ):
-
-                  entry = (
-                      "The initial catalyst appears substantially "
-                      "reflected in price. Require a fresh catalyst "
-                      "or a technically confirmed setup rather "
-                      "than chasing the original announcement."
-                  )
-
-                  exit = (
-                      "The original announcement should no longer "
-                      "be treated as the sole reason to remain in "
-                      "the position."
-                  )
-
               else:
-
-                  entry = (
-                      "Market data must be verified before using "
-                      "an entry trigger."
-                  )
-
-                  exit = (
-                      "Market data must be verified before using "
-                      "an exit trigger."
-                  )
-
-              # -----------------------------------------------------
-              # BENEFICIARY PRICE TABLE
-              # -----------------------------------------------------
-
-              if beneficiary_prices:
-
-                  bp_text = "\n".join(
-                      f"• {bt}: "
-                      f"${bp['price']:.2f} "
-                      f"({bp['one_day']:+.2f}%)"
-                      for bt, bp
-                      in beneficiary_prices
-                  )
-
-              else:
-
-                  bp_text = (
-                      "No beneficiary price confirmed."
-                  )
-
-              # -----------------------------------------------------
-              # EVIDENCE
-              # -----------------------------------------------------
-
-              if item["evidence"]:
-
-                  evidence_text = "\n".join(
-                      "• " + x
-                      for x in item[
-                          "evidence"
-                      ][:3]
-                  )
-
-              else:
-
-                  evidence_text = (
-                      "No strong beneficiary sentence extracted."
-                  )
-
-              # -----------------------------------------------------
-              # FINAL TELEGRAM MESSAGE
-              # -----------------------------------------------------
+                  bamboo = "NOT VERIFIED"
+                  entry = "No trade until a listed beneficiary is verified."
+                  exit_plan = "No position until beneficiary/ticker is verified."
 
               message = (
                   "🚨 CAPITAL FLOW ALERT\n\n"
-
-                  f"🏢 Company / Source:\n"
-                  f"{item['company']}\n\n"
-
-                  f"📄 Source type: {item['source']}\n"
-                  f"📑 Form: {item['form']}\n"
-                  f"🎯 Primary ticker: {ticker}\n\n"
-
-                  f"💰 CAPITAL DETECTED:\n"
-                  f"{money_display(item['money'])}\n\n"
-
-                  f"📊 SIGNAL SCORE:\n"
-                  f"{item['score']}/100\n\n"
-
-                  f"🔥 CAPITAL FLOW ALPHA SCORE:\n"
-                  f"{alpha}/100\n\n"
-
-                  "🔎 BENEFICIARY EVIDENCE:\n"
-                  f"{evidence_text}\n\n"
-
-                  f"{beneficiary_text}\n"
-                  f"{beneficiary_warning}\n\n"
-
-                  "📈 BENEFICIARY PRICE CHECK:\n"
-                  f"{bp_text}\n\n"
-
-                  "📈 PRIMARY STOCK REPRICING:\n"
-                  f"Price: {price_text}\n"
-                  f"1-session move: {day_text}\n"
-                  f"5-session move: {five_text}\n"
-                  f"Status: {status}\n\n"
-
-                  f"{first_mover}\n\n"
-
-                  "🟦 BAMBOO:\n"
-                  f"{bamboo}\n\n"
-
-                  "🎯 ENTRY FRAMEWORK:\n"
-                  f"{entry}\n\n"
-
-                  "🚪 EXIT FRAMEWORK:\n"
-                  f"{exit}\n\n"
-
-                  f"🕐 Published/filed:\n"
-                  f"{item['updated']}\n\n"
-
-                  f"🔗 {item['url']}\n\n"
-
-                  "⚠️ Automated research signal — "
-                  "verify the underlying announcement, "
-                  "beneficiary relationship, current quote "
-                  "and Bamboo availability before trading."
+                  f"EVENT: {title}\n"
+                  f"SOURCE: {event.get('source', 'SEC')}"
+                  f" {event.get('form', '')}\n"
+                  f"CAPITAL: {amount}\n\n"
+                  "PUBLIC-COMPANY CANDIDATES:\n"
+                  f"{candidate_text}\n\n"
+                  f"BENEFICIARY STATUS: {beneficiary}\n"
+                  f"ALPHA SIGNAL: {alpha} ({event['score']}/100)\n"
+                  f"MARKET MOVE: {repricing}\n"
+                  f"FIRST-MOVER: {first_mover}\n\n"
+                  f"BAMBOO: {bamboo}\n\n"
+                  f"ENTRY: {entry}\n\n"
+                  f"EXIT PLAN: {exit_plan}\n\n"
+                  f"SEC/NEWS: {event['link']}"
               )
 
-              try:
+              alerts.append((key, message))
 
-                  telegram(message)
+          # Send no more than 5 new alerts per run.
+          alerts = alerts[:5]
 
-                  print(
-                      "ALERT SENT:",
-                      ticker,
-                      item["title"]
-                  )
+          if alerts:
+              for key, message in alerts:
+                  try:
+                      telegram(message)
+                      print("Telegram alert sent.")
+                      seen.add(key)
+                  except Exception as e:
+                      print("Telegram error:", e)
+          else:
+              print("No new qualifying alerts.")
 
-                  seen.add(
-                      item["id"]
-                  )
+          # Keep state manageable.
+          state["seen"] = list(seen)[-2000:]
 
-              except Exception as e:
+          with open(STATE_FILE, "w", encoding="utf-8") as f:
+              json.dump(state, f, indent=2)
 
-                  print(
-                      "Telegram send failed:",
-                      e
-                  )
-
-          # =========================================================
-          # SAVE STATE
-          # =========================================================
-
-          save_state(seen)
-
-          print(
-              "========================================"
-          )
-
-          print(
-              "FINAL CAPITAL FLOW RADAR COMPLETE"
-          )
-
-          print(
-              "Qualifying new signals:",
-              len(all_candidates)
-          )
-
-          print(
-              "========================================"
-          )
-
+          print("Radar completed successfully.")
           PY
 
       - name: Save radar state
         run: |
-          git config user.name "capital-flow-radar"
-          git config user.email "capital-flow-radar@users.noreply.github.com"
+          git config user.name "Capital Flow Radar"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add radar_state.json
 
