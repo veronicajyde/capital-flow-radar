@@ -2,13 +2,15 @@ name: Capital Flow Radar
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
 
 jobs:
-  test:
+  radar:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Telegram
+      - name: Run Capital Flow Radar
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -17,15 +19,42 @@ jobs:
           import os
           import json
           import urllib.request
+          import urllib.error
+          from datetime import datetime, timezone
 
           token = os.environ["TELEGRAM_BOT_TOKEN"]
           chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          message = f"""🚨 CAPITAL FLOW RADAR
+
+SYSTEM ONLINE
+
+Scan time: {now}
+
+🔎 Monitoring:
+• Major IPOs
+• Secondary offerings
+• Large capex announcements
+• AI/data-center infrastructure spending
+• Major infrastructure projects
+• Public-company beneficiaries
+
+📊 Next stage:
+Identify listed contractors/suppliers
+→ verify capital-flow exposure
+→ check repricing
+→ calculate Alpha Score
+→ determine first-mover window
+
+🟢 Radar is operational."""
 
           url = f"https://api.telegram.org/bot{token}/sendMessage"
 
           data = json.dumps({
               "chat_id": chat_id,
-              "text": "✅ CAPITAL FLOW RADAR\n\nTelegram connection is working."
+              "text": message
           }).encode()
 
           request = urllib.request.Request(
@@ -34,6 +63,15 @@ jobs:
               headers={"Content-Type": "application/json"}
           )
 
-          response = urllib.request.urlopen(request)
-          print(response.read().decode())
+          try:
+              response = urllib.request.urlopen(request)
+              result = json.loads(response.read().decode())
+
+              if not result.get("ok"):
+                  raise RuntimeError(result)
+
+              print("Radar test successful.")
+          except urllib.error.HTTPError as e:
+              print(e.read().decode())
+              raise
           PY
