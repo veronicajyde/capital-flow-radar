@@ -44,6 +44,229 @@ SEC_FEEDS = {
 }
 
 # High-confidence mappings for relationships that are often described without tickers.
+
+SEC_COMPANY_CACHE = {}
+
+def sec_cik_from_url(url):
+    m = re.search(r"/data/(\d+)/", url or "")
+    return m.group(1).lstrip("0") if m else ""
+
+def sec_company_metadata(cik):
+    cik = str(cik).zfill(10)
+    if cik in SEC_COMPANY_CACHE:
+        return SEC_COMPANY_CACHE[cik]
+    try:
+        raw = http_get(
+            f"https://data.sec.gov/submissions/CIK{cik}.json",
+            headers={"User-Agent": SEC_UA, "Accept-Encoding": "gzip"},
+            timeout=20,
+            retries=2,
+        )
+        data = json.loads(raw.decode("utf-8"))
+        name = data.get("name", "")
+        tickers = data.get("tickers", []) or []
+        exchanges = data.get("exchanges", []) or []
+        result = {
+            "name": name,
+            "tickers": [str(x).upper() for x in tickers if x],
+            "exchanges": exchanges,
+        }
+        SEC_COMPANY_CACHE[cik] = result
+        return result
+    except Exception as e:
+        print("SEC company metadata error", cik, e)
+        return {"name": "", "tickers": [], "exchanges": []}
+
+def sec_index_documents(index_html, base_url):
+    docs = []
+    # SEC index pages expose document links and descriptions. Prefer HTML/text exhibits.
+    pattern = re.compile(
+        r'href=["\']([^"\']+)["\'][^>]*>([^<]{1,180})</a>',
+        re.I
+    )
+    for href, label in pattern.findall(index_html):
+        href = html.unescape(href)
+        label = clean_text(label)
+        if not href or href.startswith("#"):
+            continue
+        full = urllib.parse.urljoin(base_url, href)
+        if re.search(r'\.(?:htm|html|txt)$', full, re.I):
+            docs.append((full, label))
+    # De-duplicate while preserving order.
+    out, seen_docs = [], set()
+    for x in docs:
+        if x[0] not in seen_docs:
+            out.append(x)
+            seen_docs.add(x[0])
+    return out
+
+def sec_accepted_datetime(index_html):
+    m = re.search(
+        r'(?:Accepted|Acceptance Date(?:\s*/\s*Time)?|ACCEPTANCE-DATETIME)'
+        r'.{0,500}?(\d{4})[-/]?(\d{2})[-/]?(\d{2}).{0,120}?(\d{2}):?(\d{2}):?(\d{2})',
+        index_html,
+        re.I | re.S
+    )
+    if m:
+        try:
+            return datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                tzinfo=timezone.utc
+            )
+        except Exception:
+            pass
+
+    # Complete submission text/header is a more reliable fallback.
+    m = re.search(r'ACCEPTANCE-DATETIME:\s*(\d{14})', index_html, re.I)
+    if m:
+        raw = m.group(1)
+        try:
+            # SEC displays acceptance time as Eastern; convert conservatively.
+            from zoneinfo import ZoneInfo
+            return datetime.strptime(raw, "%Y%m%d%H%M%S").replace(
+                tzinfo=ZoneInfo("America/New_York")
+            ).astimezone(timezone.utc)
+        except Exception:
+            pass
+    return None
+
+def sec_items(index_html):
+    items = set()
+    for m in re.finditer(r'Item\s+(\d+\.\d+)\s*:\s*([^<\n\r]+)', index_html, re.I):
+        items.add((m.group(1), clean_text(m.group(2))))
+    return sorted(items)
+
+def sec_document_priority(label, url):
+    x = (label + " " + url).lower()
+    if "press release" in x or "exhibit 99" in x or "ex-99" in x:
+        return 0
+    if "exhibit 10" in x or "ex-10" in x:
+        return 1
+    if "exhibit 2" in x or "ex-2" in x:
+        return 2
+    if "8-k" in x or "6-k" in x or "current report" in x:
+        return 3
+    return 4
+
+def sec_extract_relevant_text(index_url):
+    try:
+        raw_index = http_get(index_url, headers={"User-Agent": SEC_UA}, timeout=25, retries=2)
+        index_html = raw_index.decode("utf-8", errors="ignore")
+    except Exception as e:
+        print("SEC index fetch failed:", e)
+        return "", None, [], []
+
+    accepted = sec_accepted_datetime(index_html)
+    items = sec_items(index_html)
+    docs = sec_index_documents(index_html, index_url)
+
+    texts = []
+    for url, label in sorted(docs, key=lambda x: sec_document_priority(x[1], x[0]))[:8]:
+        # Avoid image/data/XBRL files.
+        if re.search(r'\.(?:jpg|jpeg|png|gif|xml|xsd|json)$', url, re.I):
+            continue
+        try:
+            raw = http_get(url, headers={"User-Agent": SEC_UA}, timeout=20, retries=2)
+            txt = clean_text(raw.decode("utf-8", errors="ignore"))
+            if len(txt) >= 200:
+                texts.append(txt[:120000])
+        except Exception as e:
+            print("SEC exhibit fetch failed:", url, e)
+
+    return "\n ".join(texts), accepted, items, docs
+
+def sec_material_signal(form, items, text):
+    low = text.lower()
+    item_numbers = {x[0] for x in items}
+
+    # These are the SEC sections most likely to contain capital/deal events.
+    material_items = {"1.01", "2.01", "2.03", "3.02", "5.02", "7.01", "8.01"}
+    has_material_item = bool(item_numbers & material_items)
+
+    if form in ("S-1", "S-3", "424B4", "424B5"):
+        return True
+    if form in ("8-K", "6-K") and not has_material_item:
+        return False
+
+    # A 6-K can disclose financing/contract events without a 1.01-style item.
+    financing = any(x in low for x in [
+        "securities purchase agreement", "registered direct offering",
+        "private placement", "public offering", "ordinary shares",
+        "preferred shares", "warrants", "convertible", "subscription agreement",
+        "financing", "funding", "investment agreement", "purchase order",
+        "framework agreement", "definitive agreement", "material contract",
+    ])
+    return has_material_item or financing
+
+def sec_classify_precise(form, items, text):
+    low = text.lower()
+
+    # Hard exclusions: filings that frequently create noise but do not represent
+    # fresh capital deployment.
+    if any(x in low for x in [
+        "auditor", "accounting firm", "board committee", "director resignation",
+        "director appointment", "executive officer", "annual meeting",
+        "compensation", "employment agreement", "bylaws", "articles of incorporation",
+        "restated certificate", "shareholder voting", "proxy", "earnings",
+        "financial results", "quarterly results",
+    ]):
+        # Do not exclude if the same document contains a strong financing/transaction signal.
+        if not any(x in low for x in [
+            "securities purchase agreement", "private placement", "registered direct",
+            "underwriting agreement", "acquisition agreement", "merger agreement",
+            "purchase order", "awarded a contract", "new contract",
+            "financing agreement", "credit agreement",
+        ]):
+            return "NON_CAPITAL", False
+
+    if any(x in low for x in [
+        "force majeure", "termination", "terminated", "cancelled", "canceled",
+        "suspended", "suspension", "delay", "delayed", "withdrawn",
+        "rescinded", "default", "bankruptcy",
+    ]):
+        # A termination can itself be capital-flow relevant, but it is not new money.
+        return "CAPITAL_RISK_OR_REVERSAL", False
+
+    if any(x in low for x in [
+        "securities purchase agreement", "registered direct offering",
+        "private placement", "public offering", "underwritten offering",
+        "shares of common stock", "preferred stock", "convertible notes",
+        "warrants", "subscription agreement", "gross proceeds",
+        "net proceeds", "purchase price per share",
+    ]):
+        return "NEW_FUNDING", True
+
+    if any(x in low for x in [
+        "purchase order", "awarded", "award agreement", "supply agreement",
+        "customer agreement", "definitive agreement", "framework agreement",
+        "master services agreement", "long-term agreement", "contract with",
+        "selected as", "selected to provide", "procurement",
+    ]):
+        # Only count as a contract if there is a commercial counterparty/event,
+        # not merely an exhibit containing generic legal language.
+        commercial = any(x in low for x in [
+            "contract", "customer", "purchase order", "purchase commitment",
+            "revenue", "backlog", "megawatt", "mw", "gigawatt", "gw",
+            "supply", "services", "facility", "data center", "construction",
+        ])
+        return ("NEW_CONTRACT", False) if commercial else ("NON_CAPITAL", False)
+
+    if any(x in low for x in [
+        "acquisition agreement", "merger agreement", "business combination",
+        "acquire", "acquisition", "merger", "transaction value",
+    ]):
+        return "M&A_OR_DEAL", False
+
+    if any(x in low for x in [
+        "capital expenditure", "capital expenditures", "capex",
+        "construct", "construction", "build a", "builds a", "expansion",
+        "expand capacity", "new facility", "data center",
+    ]):
+        return "NEW_CAPEX", False
+
+    return "NON_CAPITAL", False
+
 KNOWN_TICKERS = {
     "oracle": "ORCL",
     "oracle corporation": "ORCL",
@@ -361,7 +584,9 @@ def score_event(kind, amount, tickers, beneficiaries, title, desc):
     text = (title + " " + desc).lower()
     score = 0
 
-    if kind in ("NEW_CAPITAL", "CONTRACT_OR_PROCUREMENT"):
+    if kind == "NEW_CAPITAL":
+        score += 30
+    elif kind == "CONTRACT_OR_PROCUREMENT":
         score += 25
     elif kind == "M&A_OR_DEAL":
         score += 18
@@ -437,33 +662,38 @@ def bamboo_status(tickers):
     return "CHECK REQUIRED — verify ticker is tradable in Bamboo"
 
 def entry_exit(score, repricing):
-    if score < 55:
-        return (
-            "NO AUTOMATIC ENTRY",
-            "Wait for confirmation; do not chase a weak/ambiguous signal."
-        )
-
     if repricing is None:
+        if score >= 60:
+            return (
+                "VERIFY FIRST",
+                "No live repricing check. Confirm the event, beneficiary relationship, and Bamboo tradability before any execution."
+            )
         return (
-            "WATCH / VERIFY",
-            "If entered, define risk before execution; no live-price confirmation available."
+            "NO ENTRY",
+            "Signal is not sufficiently verified for an execution decision."
         )
 
     if repricing >= 10:
         return (
             "DO NOT CHASE",
-            "Already strongly repriced; wait for consolidation or a fresh confirmation."
+            "Already strongly repriced; wait for consolidation/retest or a new catalyst."
         )
 
     if repricing >= 5:
         return (
-            "CAUTION / WAIT",
-            "Repricing is underway; prefer a pullback/retest rather than chasing."
+            "WAIT / PULLBACK",
+            "Repricing is underway; avoid chasing the first move."
+        )
+
+    if score >= 60:
+        return (
+            "EARLY-WINDOW WATCH",
+            "Verify the event and Bamboo tradability before execution."
         )
 
     return (
-        "EARLY-WINDOW WATCH",
-        "Consider only after verifying the announcement, beneficiary relationship, and Bamboo tradability."
+        "WATCH",
+        "Wait for stronger confirmation."
     )
 
 def parse_atom(raw):
@@ -481,85 +711,148 @@ def parse_atom(raw):
 
 def sec_events():
     events = []
+
     for form, url in SEC_FEEDS.items():
         try:
-            raw = http_get(url, headers={"User-Agent": SEC_UA, "Accept-Encoding": "gzip"}, timeout=30, retries=3)
+            raw = http_get(
+                url,
+                headers={"User-Agent": SEC_UA, "Accept-Encoding": "gzip"},
+                timeout=30,
+                retries=3,
+            )
             items = parse_atom(raw)[:SEC_LIMIT_PER_FEED]
         except Exception as e:
             print("SEC feed error", form, e)
             continue
 
-        for title, link, published, summary in items:
-            if not is_recent(published):
+        for title, link, feed_dt, summary in items:
+            if not link:
                 continue
 
-            text = clean_text(title + " " + summary)
-            low = text.lower()
-
-            # Reject obvious SPAC / trust / shell filings unless the filing clearly contains
-            # a material operating-company transaction.
-            if any(x in low for x in [
-                "blank check", "shell company", "securitization trust",
-                "funding llc", "special purpose acquisition"
-            ]):
+            # The Atom feed date is only a discovery hint. The official EDGAR
+            # acceptance timestamp is the authoritative freshness timestamp.
+            try:
+                filing_text, accepted, sec_items_list, docs = sec_extract_relevant_text(link)
+            except Exception as e:
+                print("SEC extraction error:", e)
                 continue
 
-            # SEC filing titles alone are not enough. Inspect the filing page when possible.
-            body = ""
-            if link:
-                try:
-                    raw_body = http_get(link, headers={"User-Agent": SEC_UA}, timeout=25, retries=2)
-                    body = clean_text(raw_body.decode("utf-8", errors="ignore"))
-                except Exception as e:
-                    print("SEC filing fetch failed:", e)
-
-            combined = (title + " " + summary + " " + body)[:250000]
-            kind, _, positives = classify_news(title, combined)
-
-            if kind in ("RISK_OR_REVERSAL", "COMMENTARY", "BACKGROUND"):
+            event_dt = accepted or feed_dt
+            if not is_recent(event_dt):
                 continue
+
+            # Ignore routine filings before doing expensive classification.
+            if not sec_material_signal(form, sec_items_list, filing_text):
+                continue
+
+            classification, fresh_money = sec_classify_precise(
+                form, sec_items_list, filing_text
+            )
+
+            if classification in ("NON_CAPITAL", "CAPITAL_RISK_OR_REVERSAL"):
+                # Risk/reversal is deliberately not sent as a capital-deployment alert.
+                continue
+
+            combined = clean_text(title + " " + summary + " " + filing_text)
 
             amount, raw_amount = extract_capital(combined)
-            new_money = capital_is_new_money(combined)
 
-            # Require either explicit new-money language or a material contract/deal signal.
-            if kind == "NEW_CAPITAL" and not new_money:
-                continue
+            # Funding: require explicit proceeds/funding language.
+            if classification == "NEW_FUNDING":
+                funding_language = any(x in combined.lower() for x in [
+                    "gross proceeds", "net proceeds", "will receive",
+                    "aggregate purchase price", "offering proceeds",
+                    "raise approximately", "raising approximately",
+                    "financing of", "funding of",
+                ])
+                if not funding_language:
+                    # It may still be a financing document, but without disclosed
+                    # proceeds it is too ambiguous for the capital-flow radar.
+                    amount = 0
+                    raw_amount = ""
 
-            tickers = get_tickers(combined)
+            # For contracts/capex, a project value is useful only when tied to
+            # an actual agreement/commitment rather than historical background.
+            if classification in ("NEW_CONTRACT", "NEW_CAPEX"):
+                if not any(x in combined.lower() for x in [
+                    "signed", "entered into", "entered an agreement",
+                    "awarded", "purchase order", "selected", "committed",
+                    "will build", "will construct", "will invest",
+                    "framework agreement", "supply agreement",
+                ]):
+                    continue
 
-            # SEC filing body can contain the company name, but not always a clean ticker.
+            cik = sec_cik_from_url(link)
+            meta = sec_company_metadata(cik) if cik else {"name": "", "tickers": []}
+
+            tickers = set(meta.get("tickers", []))
+            tickers.update(get_tickers(combined))
+
+            # Beneficiaries are companies other than the filer when possible.
             beneficiaries = []
+            filer_name = meta.get("name", "").lower()
             for name, ticker in KNOWN_TICKERS.items():
                 if re.search(r"\b" + re.escape(name) + r"\b", combined, re.I):
-                    beneficiaries.append(f"{name.title()} ({ticker})")
-            beneficiaries = list(dict.fromkeys(beneficiaries))[:5]
+                    if name.lower() not in filer_name:
+                        beneficiaries.append(f"{name.title()} ({ticker})")
 
-            event_dt = find_event_date(combined, published)
-            if event_dt and not is_recent(event_dt):
-                continue
+            # If the filer itself is the public beneficiary, include it separately.
+            if meta.get("tickers"):
+                filer_label = meta.get("name", "Filer")
+                beneficiaries.insert(
+                    0,
+                    f"{filer_label} ({', '.join(meta['tickers'][:3])})"
+                )
 
-            score = score_event(kind, amount if new_money else 0, tickers, beneficiaries, title, combined)
+            beneficiaries = list(dict.fromkeys(beneficiaries))[:8]
+
+            # SEC title + accession number is the stable event identity.
+            accession = re.search(r"/Archives/edgar/data/\d+/([^/]+)/", link)
+            accession_id = accession.group(1) if accession else link
+
             key = hashlib.sha256(
-                (form + "|" + canonical_title(title) + "|" + (link or "")).encode()
+                (
+                    "SEC|" + accession_id + "|" +
+                    classification + "|" +
+                    ",".join(sorted(tickers))
+                ).encode()
             ).hexdigest()[:20]
+
+            score = score_event(
+                "NEW_CAPITAL" if classification == "NEW_FUNDING" else (
+                    "CONTRACT_OR_PROCUREMENT"
+                    if classification in ("NEW_CONTRACT", "NEW_CAPEX")
+                    else "M&A_OR_DEAL"
+                ),
+                amount,
+                sorted(tickers),
+                beneficiaries,
+                title,
+                combined[:30000],
+            )
 
             events.append({
                 "source_type": "SEC",
                 "form": form,
                 "title": title,
                 "url": link,
-                "published": published.isoformat(),
-                "event_dt": event_dt.isoformat() if event_dt else None,
-                "kind": kind,
-                "amount": amount if new_money else 0,
-                "raw_amount": raw_amount if new_money else "",
-                "new_money": new_money,
-                "tickers": tickers,
+                "published": feed_dt.isoformat() if feed_dt else event_dt.isoformat(),
+                "event_dt": event_dt.isoformat(),
+                "kind": (
+                    "NEW_CAPITAL" if classification == "NEW_FUNDING"
+                    else "CONTRACT_OR_PROCUREMENT" if classification in ("NEW_CONTRACT", "NEW_CAPEX")
+                    else "M&A_OR_DEAL"
+                ),
+                "sec_classification": classification,
+                "amount": amount,
+                "raw_amount": raw_amount,
+                "new_money": fresh_money or classification in ("NEW_CONTRACT", "NEW_CAPEX", "M&A_OR_DEAL"),
+                "tickers": sorted(tickers)[:8],
                 "beneficiaries": beneficiaries,
                 "score": score,
                 "key": key,
             })
+
     return events
 
 def google_news_events():
