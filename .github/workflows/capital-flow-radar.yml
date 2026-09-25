@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Capital Flow Beneficiary Detector
+      - name: Capital Flow Market Analyzer
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -45,10 +45,6 @@ jobs:
               "&output=atom"
           )
 
-          # --------------------------------------------------
-          # HTTP
-          # --------------------------------------------------
-
           def get_url(url):
 
               request = urllib.request.Request(
@@ -66,17 +62,15 @@ jobs:
               if response.headers.get(
                   "Content-Encoding"
               ) == "gzip":
+
                   raw = gzip.decompress(raw)
 
               return raw
 
-          # --------------------------------------------------
-          # CLEAN HTML
-          # --------------------------------------------------
-
           def clean_html(text):
 
               text = unescape(text or "")
+
               text = re.sub(
                   r"<[^>]+>",
                   " ",
@@ -92,7 +86,7 @@ jobs:
               return text.strip()
 
           # --------------------------------------------------
-          # CAPITAL SIGNALS
+          # CAPITAL FLOW TERMS
           # --------------------------------------------------
 
           capital_terms = [
@@ -105,7 +99,6 @@ jobs:
               "infrastructure",
               "manufacturing facility",
               "production facility",
-              "new facility",
               "facility expansion",
               "capacity expansion",
               "purchase commitment",
@@ -118,7 +111,6 @@ jobs:
               "investment agreement",
               "financing agreement",
               "credit facility",
-              "term loan",
               "acquisition",
               "merger",
               "offering"
@@ -127,7 +119,6 @@ jobs:
           beneficiary_terms = [
               "supplier",
               "supplied by",
-              "supply",
               "vendor",
               "contractor",
               "contracted",
@@ -158,8 +149,12 @@ jobs:
               re.IGNORECASE | re.VERBOSE
           )
 
+          ticker_pattern = re.compile(
+              r"\b[A-Z]{1,5}\b"
+          )
+
           # --------------------------------------------------
-          # GET RSS
+          # SEC
           # --------------------------------------------------
 
           raw = get_url(RSS_URL)
@@ -176,15 +171,11 @@ jobs:
           )
 
           print(
-              "SEC filings retrieved:",
+              "SEC filings:",
               len(entries)
           )
 
           candidates = []
-
-          # --------------------------------------------------
-          # INITIAL FILTER
-          # --------------------------------------------------
 
           for entry in entries:
 
@@ -214,6 +205,7 @@ jobs:
               link = ""
 
               if link_element is not None:
+
                   link = link_element.attrib.get(
                       "href",
                       ""
@@ -224,22 +216,24 @@ jobs:
               )
 
               combined = (
-                  title + " " +
+                  title +
+                  " " +
                   summary_clean
-              ).lower()
+              )
 
-              matched_capital = [
-                  x for x in capital_terms
-                  if x in combined
+              lower = combined.lower()
+
+              matched = [
+                  term
+                  for term in capital_terms
+                  if term in lower
               ]
 
-              if not matched_capital:
+              if not matched:
                   continue
 
-              score = 0
-
-              score += min(
-                  len(matched_capital) * 10,
+              score = min(
+                  len(matched) * 10,
                   40
               )
 
@@ -251,7 +245,7 @@ jobs:
                   score += 25
 
               if any(
-                  x in combined
+                  x in lower
                   for x in [
                       "data center",
                       "data centre",
@@ -264,7 +258,7 @@ jobs:
                   score += 20
 
               if any(
-                  x in combined
+                  x in lower
                   for x in [
                       "supply agreement",
                       "contract award",
@@ -282,138 +276,140 @@ jobs:
                   "summary": summary_clean,
                   "published": published,
                   "link": link,
-                  "capital_signals": matched_capital,
-                  "money": money,
-                  "score": min(score, 100)
+                  "score": min(score, 100),
+                  "money": money
               })
 
           candidates = candidates[:5]
 
-          print(
-              "Qualified candidates:",
-              len(candidates)
-          )
-
           # --------------------------------------------------
-          # RETRIEVE FILINGS
+          # ANALYZE FILING CONTENT
           # --------------------------------------------------
 
-          analyzed = []
+          results = []
 
           for item in candidates:
 
-              filing_text = ""
+              text = ""
 
               try:
 
-                  if item["link"]:
+                  raw_filing = get_url(
+                      item["link"]
+                  )
 
-                      filing_raw = get_url(
-                          item["link"]
+                  text = clean_html(
+                      raw_filing.decode(
+                          "utf-8",
+                          errors="replace"
                       )
-
-                      filing_text = clean_html(
-                          filing_raw.decode(
-                              "utf-8",
-                              errors="replace"
-                          )
-                      )
+                  )
 
               except Exception as e:
 
                   print(
-                      "Could not retrieve filing:",
+                      "Filing retrieval error:",
                       e
                   )
 
-              # Limit text for processing
-              filing_text = filing_text[:50000]
+              text = text[:100000]
 
-              lower_text = filing_text.lower()
-
-              beneficiary_hits = []
-
-              for term in beneficiary_terms:
-
-                  if term in lower_text:
-                      beneficiary_hits.append(
-                          term
-                      )
-
-              # ------------------------------------------------
-              # FIND SENTENCES AROUND BENEFICIARY LANGUAGE
-              # ------------------------------------------------
+              lower = text.lower()
 
               evidence = []
 
               sentences = re.split(
                   r"(?<=[.!?])\s+",
-                  filing_text
+                  text
               )
 
               for sentence in sentences:
 
-                  s_lower = sentence.lower()
+                  s = sentence.lower()
 
                   if any(
-                      term in s_lower
+                      term in s
                       for term in beneficiary_terms
                   ):
 
                       if (
-                          len(sentence) > 50
-                          and len(sentence) < 1000
+                          60 <= len(sentence) <= 1000
                       ):
+
                           evidence.append(
                               sentence.strip()
                           )
 
-                  if len(evidence) >= 3:
+                  if len(evidence) >= 5:
                       break
 
-              # ------------------------------------------------
-              # FIND MONEY REFERENCES
-              # ------------------------------------------------
+              # ----------------------------------------------
+              # TICKER CANDIDATES
+              # ----------------------------------------------
 
-              filing_money = money_pattern.findall(
-                  filing_text
-              )
+              possible_tickers = []
 
-              item["beneficiary_language"] = (
-                  beneficiary_hits[:8]
-              )
+              for ticker in ticker_pattern.findall(
+                  text[:50000]
+              ):
 
-              item["evidence"] = evidence
+                  # Remove common English words
+                  if ticker in {
+                      "THE",
+                      "AND",
+                      "FOR",
+                      "WITH",
+                      "FROM",
+                      "THIS",
+                      "THAT",
+                      "COMPANY",
+                      "CORP",
+                      "INC",
+                      "LLC",
+                      "SEC",
+                      "USD",
+                      "NYSE",
+                      "NASDAQ"
+                  }:
+                      continue
 
-              item["filing_money"] = (
-                  filing_money[:10]
-              )
+                  if ticker not in possible_tickers:
+                      possible_tickers.append(
+                          ticker
+                      )
 
-              analyzed.append(item)
+                  if len(possible_tickers) >= 15:
+                      break
+
+              results.append({
+                  **item,
+                  "evidence": evidence,
+                  "ticker_candidates":
+                      possible_tickers
+              })
 
           # --------------------------------------------------
           # TELEGRAM
           # --------------------------------------------------
 
-          if not analyzed:
-
+          if not results:
               print(
-                  "No capital-flow events found."
+                  "No qualifying events."
               )
-
               raise SystemExit(0)
 
           lines = [
               "🚨 CAPITAL FLOW RADAR",
               "",
-              "NEW CAPITAL-FLOW EVENT",
+              "NEW CAPITAL-FLOW SIGNAL",
               ""
           ]
 
-          for item in analyzed:
+          for item in results:
 
               lines.append(
-                  f"📊 SIGNAL SCORE: {item['score']}/100"
+                  f"📊 SIGNAL SCORE: "
+                  f"{item['score']}/100"
               )
 
               lines.append(
@@ -423,36 +419,36 @@ jobs:
               if item["money"]:
 
                   lines.append(
-                      "💰 Amount: " +
+                      "💰 Capital detected: " +
                       ", ".join(
                           item["money"][:5]
                       )
                   )
 
-              if item["beneficiary_language"]:
+              if item["ticker_candidates"]:
 
                   lines.append(
-                      "🏢 Beneficiary language: " +
+                      "🎯 Ticker candidates: " +
                       ", ".join(
                           item[
-                              "beneficiary_language"
-                          ]
+                              "ticker_candidates"
+                          ][:10]
                       )
                   )
 
               if item["evidence"]:
 
                   lines.append(
-                      "🔎 Evidence:"
+                      "🏢 Beneficiary evidence:"
                   )
 
                   for evidence in item[
                       "evidence"
-                  ]:
+                  ][:3]:
 
                       lines.append(
                           "• " +
-                          evidence[:500]
+                          evidence[:450]
                       )
 
               lines.append(
@@ -460,33 +456,35 @@ jobs:
                   item["published"]
               )
 
-              if item["link"]:
-
-                  lines.append(
-                      "🔗 " +
-                      item["link"]
-                  )
+              lines.append(
+                  "🔗 " +
+                  item["link"]
+              )
 
               lines.append("")
 
           lines.append(
-              "⚠️ BENEFICIARY STATUS"
+              "⚠️ BAMBOO STATUS: "
+              "NOT YET VERIFIED"
           )
 
           lines.append(
-              "The system has identified "
-              "beneficiary evidence, but has "
-              "NOT yet verified the beneficiary "
-              "as a publicly traded Bamboo asset."
+              "⚠️ Ticker candidates require "
+              "verification before trading."
           )
 
           lines.append("")
 
           lines.append(
-              "NEXT: ticker verification → "
-              "Bamboo availability → "
-              "price movement → "
-              "Alpha Score → entry/exit plan"
+              "NEXT LAYER:"
+          )
+
+          lines.append(
+              "Price movement → "
+              "repricing → "
+              "Bamboo verification → "
+              "Alpha Score → "
+              "entry/exit framework"
           )
 
           message = "\n".join(lines)
@@ -510,16 +508,17 @@ jobs:
               "disable_web_page_preview": True
           }).encode("utf-8")
 
-          telegram_request = urllib.request.Request(
+          request = urllib.request.Request(
               telegram_url,
               data=payload,
               headers={
-                  "Content-Type": "application/json"
+                  "Content-Type":
+                  "application/json"
               }
           )
 
           response = urllib.request.urlopen(
-              telegram_request,
+              request,
               timeout=30
           )
 
