@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v5
 
       - name: Run Capital Flow Radar
@@ -23,8 +23,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           import os
-          import re
           import json
+          import re
           import time
           import gzip
           import urllib.request
@@ -32,264 +32,191 @@ jobs:
           from datetime import datetime, timezone, timedelta
 
           UA = "Capital Flow Radar veronicajyde@gmail.com"
-          STATE_FILE = "radar_state.json"
+          STATE = "radar_state.json"
 
-          CAPITAL = [
-              "acquisition", "merger", "definitive agreement",
-              "investment", "funding", "financing", "offering",
-              "private placement", "capital expenditure", "capex",
-              "infrastructure", "data center", "datacenter",
-              "ai infrastructure", "artificial intelligence",
-              "cloud", "factory", "manufacturing", "contract",
-              "purchase agreement", "strategic investment"
+          CAPITAL_WORDS = [
+              "acquisition",
+              "merger",
+              "definitive agreement",
+              "investment",
+              "funding",
+              "financing",
+              "offering",
+              "private placement",
+              "capital expenditure",
+              "capex",
+              "infrastructure",
+              "data center",
+              "datacenter",
+              "ai infrastructure",
+              "artificial intelligence",
+              "cloud",
+              "factory",
+              "manufacturing",
+              "contract",
+              "purchase agreement",
+              "strategic investment"
           ]
 
-          BENEFICIARY = [
-              "supplier", "supplies", "provides", "provider",
-              "customer", "partner", "partnership", "contractor",
-              "equipment", "infrastructure provider", "technology provider",
-              "data center provider", "cloud provider", "manufacturer",
-              "vendor", "service provider"
+          BENEFICIARY_WORDS = [
+              "supplier",
+              "supplies",
+              "provider",
+              "customer",
+              "partner",
+              "partnership",
+              "contractor",
+              "equipment",
+              "vendor",
+              "manufacturer",
+              "service provider"
           ]
 
-          MONEY_RE = re.compile(
-              r"\$?\s*([0-9]+(?:\.[0-9]+)?)\s*(trillion|billion|million|bn|b|mm|m)",
-              re.I
-          )
-
-          def get(url, timeout=20, retries=3):
+          def fetch(url, timeout=20, retries=3):
               headers = {
                   "User-Agent": UA,
                   "Accept-Encoding": "gzip",
-                  "Accept": "application/json, application/xml, text/xml, */*"
+                  "Accept": "*/*"
               }
 
               for attempt in range(retries):
                   try:
                       req = urllib.request.Request(url, headers=headers)
-                      with urllib.request.urlopen(req, timeout=timeout) as r:
-                          data = r.read()
-                          if r.headers.get("Content-Encoding") == "gzip":
+
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          data = response.read()
+
+                          if response.headers.get("Content-Encoding") == "gzip":
                               data = gzip.decompress(data)
+
                           return data.decode("utf-8", errors="ignore")
+
                   except Exception as e:
-                      if attempt == retries - 1:
-                          print("FETCH ERROR:", e)
-                          return ""
-                      time.sleep(2 ** attempt)
+                      print("FETCH ERROR:", e)
+
+                      if attempt < retries - 1:
+                          time.sleep(2 ** attempt)
+
               return ""
 
-          def money_value(text):
-              m = MONEY_RE.search(text or "")
-              if not m:
-                  return 0
-              n = float(m.group(1))
-              unit = m.group(2).lower()
-              if unit in ("trillion",):
-                  return n * 1e12
-              if unit in ("billion", "bn", "b"):
-                  return n * 1e9
-              return n * 1e6
+          def parse_date(value):
+              if not value:
+                  return None
 
-          def money_text(v):
-              if v >= 1e12:
-                  return f"${v/1e12:.1f}T"
-              if v >= 1e9:
-                  return f"${v/1e9:.1f}B"
-              if v >= 1e6:
-                  return f"${v/1e6:.0f}M"
+              value = value.strip()
+
+              formats = [
+                  "%Y-%m-%dT%H:%M:%S%z",
+                  "%Y-%m-%dT%H:%M:%S",
+                  "%Y%m%d%H%M%S"
+              ]
+
+              for fmt in formats:
+                  try:
+                      d = datetime.strptime(value, fmt)
+
+                      if d.tzinfo is None:
+                          d = d.replace(tzinfo=timezone.utc)
+
+                      return d.astimezone(timezone.utc)
+
+                  except Exception:
+                      pass
+
+              return None
+
+          def within_24h(dt):
+              if not dt:
+                  return False
+
+              return (
+                  datetime.now(timezone.utc) - dt
+                  <= timedelta(hours=24)
+              )
+
+          def find_words(text, words):
+              text = (text or "").lower()
+
+              return [
+                  word for word in words
+                  if word.lower() in text
+              ]
+
+          def money(text):
+              pattern = re.compile(
+                  r"\$?\s*([0-9]+(?:\.[0-9]+)?)\s*"
+                  r"(trillion|billion|million|bn|mm|m|b)",
+                  re.I
+              )
+
+              match = pattern.search(text or "")
+
+              if not match:
+                  return 0
+
+              number = float(match.group(1))
+              unit = match.group(2).lower()
+
+              if unit == "trillion":
+                  return number * 1e12
+
+              if unit in ("billion", "bn", "b"):
+                  return number * 1e9
+
+              return number * 1e6
+
+          def money_label(value):
+              if value >= 1e12:
+                  return f"${value / 1e12:.1f}T"
+
+              if value >= 1e9:
+                  return f"${value / 1e9:.1f}B"
+
+              if value >= 1e6:
+                  return f"${value / 1e6:.0f}M"
+
               return "Undisclosed"
 
-          def words_found(text, words):
-              t = (text or "").lower()
-              return [w for w in words if w in t]
-
-          def ticker_candidates(text):
-              t = text or ""
+          def tickers(text):
               found = set()
 
-              for x in re.findall(r"([A-Z]{1,5})", t):
+              for x in re.findall(r"([A-Z]{1,5})", text or ""):
                   found.add(x)
 
-              for x in re.findall(r"(?:NASDAQ|NYSE|AMEX|NYSEAMERICAN)[:\s]+([A-Z]{1,5})", t, re.I):
+              for x in re.findall(
+                  r"(?:NASDAQ|NYSE|AMEX|NYSEAMERICAN)[:\s]+([A-Z]{1,5})",
+                  text or "",
+                  re.I
+              ):
                   found.add(x.upper())
 
               return list(found)
 
           def load_state():
-              if not os.path.exists(STATE_FILE):
+              if not os.path.exists(STATE):
                   return {"seen": []}
 
               try:
-                  with open(STATE_FILE, "r", encoding="utf-8") as f:
-                      x = json.load(f)
+                  with open(STATE, "r", encoding="utf-8") as f:
+                      data = json.load(f)
 
-                  if isinstance(x, list):
-                      return {"seen": x}
+                  if isinstance(data, list):
+                      return {"seen": data}
 
-                  if isinstance(x, dict):
-                      x.setdefault("seen", [])
-                      return x
+                  if isinstance(data, dict):
+                      data.setdefault("seen", [])
+                      return data
 
               except Exception as e:
-                  print("STATE LOAD ERROR:", e)
+                  print("STATE ERROR:", e)
 
               return {"seen": []}
 
-          def save_state(state):
-              with open(STATE_FILE, "w", encoding="utf-8") as f:
-                  json.dump(state, f, indent=2)
+          def save_state(data):
+              with open(STATE, "w", encoding="utf-8") as f:
+                  json.dump(data, f, indent=2)
 
-          def parse_date(s):
-              if not s:
-                  return None
-
-              for fmt in (
-                  "%Y-%m-%dT%H:%M:%S%z",
-                  "%Y-%m-%dT%H:%M:%S",
-                  "%Y%m%d%H%M%S"
-              ):
-                  try:
-                      d = datetime.strptime(s, fmt)
-                      if d.tzinfo is None:
-                          d = d.replace(tzinfo=timezone.utc)
-                      return d.astimezone(timezone.utc)
-                  except:
-                      pass
-
-              return None
-
-          def fresh(dt):
-              if not dt:
-                  return False
-              return datetime.now(timezone.utc) - dt <= timedelta(hours=24)
-
-          def repricing(ticker):
-              if not ticker:
-                  return None
-
-              url = (
-                  "https://query1.finance.yahoo.com/v8/finance/chart/"
-                  + urllib.parse.quote(ticker)
-                  + "?range=5d&interval=1d"
-              )
-
-              raw = get(url, timeout=10, retries=1)
-
-              try:
-                  j = json.loads(raw)
-                  q = j["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-                  q = [x for x in q if x is not None]
-
-                  if len(q) < 2:
-                      return None
-
-                  move = (q[-1] / q[-2] - 1) * 100
-                  return move
-              except:
-                  return None
-
-          def repricing_label(move):
-              if move is None:
-                  return "NOT VERIFIED"
-
-              if move >= 8:
-                  return f"ALREADY REPRICED (+{move:.1f}%)"
-
-              if move >= 3:
-                  return f"EARLY REPRICING (+{move:.1f}%)"
-
-              if move <= -8:
-                  return f"NEGATIVE MOVE ({move:.1f}%)"
-
-              return f"LIMITED REPRICING ({move:+.1f}%)"
-
-          def alpha(event):
-              score = 0
-
-              capital = event["capital"]
-              strength = event["beneficiary_strength"]
-              move = event["move"]
-
-              if capital >= 10e9:
-                  score += 35
-              elif capital >= 1e9:
-                  score += 28
-              elif capital >= 250e6:
-                  score += 20
-              elif capital > 0:
-                  score += 10
-
-              if strength == "DIRECT":
-                  score += 30
-              elif strength == "STRONG":
-                  score += 22
-              elif strength == "POSSIBLE":
-                  score += 12
-
-              if move is None:
-                  score += 5
-              elif move < 3:
-                  score += 20
-              elif move < 8:
-                  score += 10
-
-              if event["capital_hits"]:
-                  score += min(10, len(event["capital_hits"]) * 3)
-
-              if score >= 75:
-                  label = "HIGH SIGNAL"
-              elif score >= 55:
-                  label = "STRONG SIGNAL"
-              elif score >= 35:
-                  label = "WATCH"
-              else:
-                  label = "LOWER SIGNAL"
-
-              return score, label
-
-          def entry_exit(move):
-              if move is None:
-                  return (
-                      "ENTRY: CHECK LIVE PRICE BEFORE BUYING",
-                      "EXIT: TAKE PROFIT AFTER MATERIAL REPRICING OR WHEN THESIS BREAKS"
-                  )
-
-              if move >= 8:
-                  entry = "ENTRY: WAIT FOR PULLBACK / DO NOT CHASE"
-              elif move >= 3:
-                  entry = "ENTRY: SMALL INITIAL POSITION; WATCH FOLLOW-THROUGH"
-              else:
-                  entry = "ENTRY: EARLY-WINDOW CANDIDATE; CONFIRM CATALYST"
-
-              exit_plan = (
-                  "EXIT: CONSIDER PARTIAL PROFIT AFTER STRONG REPRICING; "
-                  "EXIT REMAINDER IF CATALYST FADES OR THESIS BREAKS"
-              )
-
-              return entry, exit_plan
-
-          def bamboo_check(ticker):
-              if not ticker:
-                  return "CHECK REQUIRED"
-
-              return "CHECK REQUIRED — verify ticker/order availability in Bamboo"
-
-          def sec_events():
-              print("Loading SEC ticker map...")
-
-              ticker_raw = get("https://www.sec.gov/files/company_tickers.json")
-              ticker_map = {}
-
-              try:
-                  data = json.loads(ticker_raw)
-                  for x in data.values():
-                      ticker_map[str(x["cik_str"]).zfill(10)] = x["ticker"]
-              except Exception as e:
-                  print("Ticker map error:", e)
-
-              print(f"Loaded {len(ticker_map)} SEC-listed companies.")
-
+          def get_sec():
               feeds = {
                   "8-K": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&owner=exclude&count=100",
                   "6-K": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=6-K&owner=exclude&count=100",
@@ -301,269 +228,4 @@ jobs:
               events = []
 
               for form, url in feeds.items():
-                  print("Checking SEC", form)
-
-                  raw = get(url, timeout=25, retries=2)
-
-                  if not raw:
-                      continue
-
-                  entries = re.findall(
-                      r"<entry>(.*?)</entry>",
-                      raw,
-                      flags=re.S | re.I
-                  )
-
-                  for entry in entries:
-                      title_m = re.search(r"<title>(.*?)</title>", entry, re.S | re.I)
-                      updated_m = re.search(r"<updated>(.*?)</updated>", entry, re.S | re.I)
-                      id_m = re.search(r"<id>(.*?)</id>", entry, re.S | re.I)
-                      summary_m = re.search(r"<summary[^>]*>(.*?)</summary>", entry, re.S | re.I)
-
-                      title = re.sub("<.*?>", " ", title_m.group(1)).strip() if title_m else ""
-                      summary = re.sub("<.*?>", " ", summary_m.group(1)).strip() if summary_m else ""
-                      ident = id_m.group(1).strip() if id_m else title
-                      dt = parse_date(updated_m.group(1).strip()) if updated_m else None
-
-                      if not fresh(dt):
-                          continue
-
-                      text_blob = f"{title} {summary}"
-                      c_hits = words_found(text_blob, CAPITAL)
-
-                      if not c_hits:
-                          continue
-
-                      cik_m = re.search(r"accession-number/(\d+)", ident, re.I)
-                      cik = cik_m.group(1).zfill(10) if cik_m else ""
-
-                      tickers = ticker_candidates(text_blob)
-
-                      if not tickers and cik in ticker_map:
-                          tickers = [ticker_map[cik]]
-
-                      capital = money_value(text_blob)
-
-                      event = {
-                          "source": "SEC",
-                          "form": form,
-                          "title": title,
-                          "url": ident,
-                          "date": dt.isoformat() if dt else "",
-                          "capital": capital,
-                          "capital_hits": c_hits,
-                          "tickers": tickers,
-                          "beneficiary_strength": "POSSIBLE",
-                          "move": None
-                      }
-
-                      events.append(event)
-
-              print("SEC qualifying events:", len(events))
-              return events
-
-          def gdelt_events():
-              now = datetime.now(timezone.utc)
-
-              # Reduce GDELT rate-limit pressure.
-              # Manual runs always check it; scheduled runs check every 15 minutes.
-              if now.minute % 15 != 0 and os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
-                  print("GDELT skipped this cycle to reduce rate limiting.")
-                  return []
-
-              query = (
-                  '("billion" OR "million" OR "investment" OR "acquisition" '
-                  'OR "contract" OR "capital expenditure" OR "data center" '
-                  'OR "AI infrastructure" OR "financing") '
-                  '("supplier" OR "provider" OR "contractor" OR "customer" '
-                  'OR "partnership" OR "equipment")'
-              )
-
-              url = (
-                  "https://api.gdeltproject.org/api/v2/doc/doc"
-                  "?query=" + urllib.parse.quote(query)
-                  + "&mode=artlist"
-                  + "&maxrecords=50"
-                  + "&format=json"
-                  + "&timespan=24h"
-                  + "&sort=datedesc"
-              )
-
-              print("Checking GDELT news...")
-
-              raw = get(url, timeout=20, retries=2)
-
-              if not raw:
-                  return []
-
-              try:
-                  data = json.loads(raw)
-              except:
-                  print("GDELT JSON error")
-                  return []
-
-              events = []
-
-              for a in data.get("articles", []):
-                  title = a.get("title", "").strip()
-                  link = a.get("url", "").strip()
-                  date_raw = a.get("seendate", "")
-
-                  dt = parse_date(date_raw)
-
-                  if not fresh(dt):
-                      continue
-
-                  capital_hits = words_found(title, CAPITAL)
-
-                  if not capital_hits:
-                      continue
-
-                  bene_hits = words_found(title, BENEFICIARY)
-
-                  strength = (
-                      "DIRECT" if len(bene_hits) >= 3
-                      else "STRONG" if len(bene_hits) >= 2
-                      else "POSSIBLE" if bene_hits
-                      else "SPECULATIVE"
-                  )
-
-                  if strength == "SPECULATIVE":
-                      continue
-
-                  tickers = ticker_candidates(title)
-
-                  events.append({
-                      "source": "NEWS",
-                      "form": "NEWS",
-                      "title": title,
-                      "url": link,
-                      "date": dt.isoformat() if dt else "",
-                      "capital": money_value(title),
-                      "capital_hits": capital_hits,
-                      "tickers": tickers,
-                      "beneficiary_strength": strength,
-                      "move": None
-                  })
-
-              print("News qualifying events:", len(events))
-              return events
-
-          def enrich(events):
-              for e in events:
-                  ticker = e["tickers"][0] if e["tickers"] else None
-
-                  if ticker:
-                      e["move"] = repricing(ticker)
-
-                  e["repricing"] = repricing_label(e["move"])
-                  e["bamboo"] = bamboo_check(ticker)
-                  e["score"], e["alpha"] = alpha(e)
-                  e["entry"], e["exit"] = entry_exit(e["move"])
-
-                  if e["beneficiary_strength"] == "DIRECT":
-                      e["beneficiary"] = "DIRECT / HIGH CONFIDENCE"
-                  elif e["beneficiary_strength"] == "STRONG":
-                      e["beneficiary"] = "STRONG EVIDENCE"
-                  elif e["beneficiary_strength"] == "POSSIBLE":
-                      e["beneficiary"] = "POSSIBLE / VERIFY"
-                  else:
-                      e["beneficiary"] = "SPECULATIVE"
-
-              return events
-
-          def event_key(e):
-              base = (
-                  e.get("source", "") + "|" +
-                  e.get("form", "") + "|" +
-                  e.get("title", "") + "|" +
-                  e.get("url", "")
-              )
-              return base.lower()
-
-          def telegram(message):
-              token = os.environ.get("TELEGRAM_BOT_TOKEN")
-              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-              if not token or not chat_id:
-                  print("Telegram secrets missing.")
-                  return False
-
-              url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-              payload = urllib.parse.urlencode({
-                  "chat_id": chat_id,
-                  "text": message,
-                  "disable_web_page_preview": "false"
-              }).encode()
-
-              try:
-                  req = urllib.request.Request(url, data=payload, method="POST")
-                  urllib.request.urlopen(req, timeout=15)
-                  return True
-              except Exception as e:
-                  print("Telegram error:", e)
-                  return False
-
-          def format_alert(e):
-              ticker = e["tickers"][0] if e["tickers"] else "TICKER NOT IDENTIFIED"
-              amount = money_text(e["capital"])
-
-              return f"""🚨 CAPITAL FLOW RADAR
-
-{e["alpha"]} — Alpha Score {e["score"]}/100
-
-📌 EVENT
-{e["title"]}
-
-🏦 SOURCE
-{e["source"]} / {e["form"]}
-
-💰 CAPITAL
-{amount}
-
-🔎 CAPITAL SIGNALS
-{", ".join(e["capital_hits"][:6])}
-
-🎯 BENEFICIARY
-{ticker}
-
-📊 BENEFICIARY EVIDENCE
-{e["beneficiary"]}
-
-📈 REPRICING
-{e["repricing"]}
-
-⚡ FIRST-MOVER WINDOW
-{"OPEN / EARLY" if e["move"] is None or e["move"] < 3 else "NARROW / PARTIALLY REPRICED"}
-
-🟢 {e["entry"]}
-
-🔴 {e["exit"]}
-
-🇳🇬 BAMBOO
-{e["bamboo"]}
-
-🔗 SOURCE
-{e["url"]}
-
-🕐 ANNOUNCED
-{e["date"]}
-
-⚠️ This is a catalyst alert, not a guaranteed trade outcome."""
-          
-          print("Starting Capital Flow Radar...")
-
-          state = load_state()
-          seen = set(state.get("seen", []))
-
-          raw_events = sec_events()
-          raw_events += gdelt_events()
-
-          print("Raw qualifying events:", len(raw_events))
-          print("Previously seen events:", len(seen))
-
-          events = enrich(raw_events)
-
-          # Highest scores first.
-          events.sort(key=lambda x: x.get("score", 
+                  print("Checking SEC",
